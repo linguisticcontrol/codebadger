@@ -19,6 +19,36 @@ from ._common import require_cpg, unwrap_result, is_error_output
 
 logger = logging.getLogger(__name__)
 
+_RESULT_FORMAT_VERSION = "named-map-v1"
+_TAINT_CALL_RESULT_MAP = (
+    '.map(c => Map("node_id" -> c.id.toString, "name" -> c.name, '
+    '"code" -> c.code, '
+    '"filename" -> c.file.name.headOption.getOrElse("unknown"), '
+    '"lineNumber" -> c.lineNumber.getOrElse(-1).toString, '
+    '"method" -> c.method.fullName))'
+)
+
+
+def _coerce_int(value: Any, default: int = -1) -> int:
+    """Convert Joern JSON scalar values to integers."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_taint_call_result(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse current named-map results and legacy tuple-shaped results."""
+    return {
+        "node_id": item.get("node_id", item.get("_1")),
+        "name": item.get("name", item.get("_2")),
+        "code": item.get("code", item.get("_3")),
+        "filename": item.get("filename", item.get("_4")),
+        "lineNumber": _coerce_int(item.get("lineNumber", item.get("_5")), -1),
+        "method": item.get("method", item.get("_6")),
+    }
+
+
 # Default taint sources by language (used when config is empty)
 DEFAULT_SOURCES = {
     "c": [
@@ -453,15 +483,21 @@ Examples:
             # from qualified patterns (e.g., 'os.system' -> 'system')
             joined = _build_joern_name_pattern(patterns)
 
-            cache_params = {"lang": lang, "patterns": sorted(set(patterns)), "filename": filename, "limit": limit}
+            cache_params = {
+                "lang": lang,
+                "patterns": sorted(set(patterns)),
+                "filename": filename,
+                "limit": limit,
+                "result_format": _RESULT_FORMAT_VERSION,
+            }
 
             def _execute():
                 # Build query with optional file filter
                 if filename:
                     file_regex = _build_file_filter_regex(filename)
-                    query = f'cpg.call.name("{escape_scala_string(joined)}").where(_.file.name("{escape_scala_string(file_regex)}")).map(c => (c.id, c.name, c.code, c.file.name.headOption.getOrElse("unknown"), c.lineNumber.getOrElse(-1), c.method.fullName)).take({clamp_int(limit, MAX_RESULT_ROWS)})'
+                    query = f'cpg.call.name("{escape_scala_string(joined)}").where(_.file.name("{escape_scala_string(file_regex)}")){_TAINT_CALL_RESULT_MAP}.take({clamp_int(limit, MAX_RESULT_ROWS)})'
                 else:
-                    query = f'cpg.call.name("{escape_scala_string(joined)}").map(c => (c.id, c.name, c.code, c.file.name.headOption.getOrElse("unknown"), c.lineNumber.getOrElse(-1), c.method.fullName)).take({clamp_int(limit, MAX_RESULT_ROWS)})'
+                    query = f'cpg.call.name("{escape_scala_string(joined)}"){_TAINT_CALL_RESULT_MAP}.take({clamp_int(limit, MAX_RESULT_ROWS)})'
 
                 result = query_executor.execute_query(
                     codebase_hash=codebase_hash,
@@ -477,14 +513,7 @@ Examples:
                 sources = []
                 for item in result.data:
                     if isinstance(item, dict):
-                        sources.append({
-                            "node_id": item.get("_1"),
-                            "name": item.get("_2"),
-                            "code": item.get("_3"),
-                            "filename": item.get("_4"),
-                            "lineNumber": item.get("_5"),
-                            "method": item.get("_6"),
-                        })
+                        sources.append(_parse_taint_call_result(item))
 
                 return {
                     "success": True,
@@ -575,15 +604,21 @@ Examples:
             # from qualified patterns (e.g., 'os.system' -> 'system')
             joined = _build_joern_name_pattern(patterns)
 
-            cache_params = {"lang": lang, "patterns": sorted(set(patterns)), "filename": filename, "limit": limit}
+            cache_params = {
+                "lang": lang,
+                "patterns": sorted(set(patterns)),
+                "filename": filename,
+                "limit": limit,
+                "result_format": _RESULT_FORMAT_VERSION,
+            }
 
             def _execute():
                 # Build query with optional file filter
                 if filename:
                     file_regex = _build_file_filter_regex(filename)
-                    query = f'cpg.call.name("{escape_scala_string(joined)}").where(_.file.name("{escape_scala_string(file_regex)}")).map(c => (c.id, c.name, c.code, c.file.name.headOption.getOrElse("unknown"), c.lineNumber.getOrElse(-1), c.method.fullName)).take({clamp_int(limit, MAX_RESULT_ROWS)})'
+                    query = f'cpg.call.name("{escape_scala_string(joined)}").where(_.file.name("{escape_scala_string(file_regex)}")){_TAINT_CALL_RESULT_MAP}.take({clamp_int(limit, MAX_RESULT_ROWS)})'
                 else:
-                    query = f'cpg.call.name("{escape_scala_string(joined)}").map(c => (c.id, c.name, c.code, c.file.name.headOption.getOrElse("unknown"), c.lineNumber.getOrElse(-1), c.method.fullName)).take({clamp_int(limit, MAX_RESULT_ROWS)})'
+                    query = f'cpg.call.name("{escape_scala_string(joined)}"){_TAINT_CALL_RESULT_MAP}.take({clamp_int(limit, MAX_RESULT_ROWS)})'
 
                 result = query_executor.execute_query(
                     codebase_hash=codebase_hash,
@@ -599,14 +634,7 @@ Examples:
                 sinks = []
                 for item in result.data:
                     if isinstance(item, dict):
-                        sinks.append({
-                            "node_id": item.get("_1"),
-                            "name": item.get("_2"),
-                            "code": item.get("_3"),
-                            "filename": item.get("_4"),
-                            "lineNumber": item.get("_5"),
-                            "method": item.get("_6"),
-                        })
+                        sinks.append(_parse_taint_call_result(item))
 
                 return {
                     "success": True,

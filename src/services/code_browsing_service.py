@@ -6,6 +6,30 @@ from ..utils.query_rendering import escape_scala_string
 
 logger = logging.getLogger(__name__)
 
+_RESULT_FORMAT_VERSION = "named-map-v1"
+
+
+def _coerce_int(value: Any, default: int = -1) -> int:
+    """Convert Joern JSON scalar values to integers without leaking parse errors."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Convert Joern JSON scalar values to booleans."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "false"}:
+            return normalized == "true"
+    if value is None:
+        return default
+    return bool(value)
+
+
 class CodeBrowsingService:
     """Service for code browsing operations with caching support"""
 
@@ -51,6 +75,7 @@ class CodeBrowsingService:
             "callee_pattern": callee_pattern,
             "include_external": include_external,
             "limit": limit,
+            "result_format": _RESULT_FORMAT_VERSION,
         }
 
         def execute_query():
@@ -69,7 +94,12 @@ class CodeBrowsingService:
                 query_parts.append(f'.where(_.callOut.name("{escape_scala_string(callee_pattern)}"))')
 
             query_parts.append(
-                ".map(m => (m.name, m.id, m.fullName, m.signature, m.filename, m.lineNumber.getOrElse(-1), m.lineNumberEnd.getOrElse(-1), m.controlStructure.size + 1, m.isExternal))"
+                '.map(m => Map("name" -> m.name, "node_id" -> m.id.toString, '
+                '"fullName" -> m.fullName, "signature" -> m.signature, '
+                '"filename" -> m.filename, "lineNumber" -> m.lineNumber.getOrElse(-1).toString, '
+                '"lineNumberEnd" -> m.lineNumberEnd.getOrElse(-1).toString, '
+                '"cyclomaticComplexity" -> (m.controlStructure.size + 1).toString, '
+                '"isExternal" -> m.isExternal.toString))'
             )
             
             query_limit = min(limit, 10000)
@@ -89,8 +119,8 @@ class CodeBrowsingService:
             methods = []
             for item in result.data:
                 if isinstance(item, dict):
-                    line_number = item.get("_6", -1)
-                    line_number_end = item.get("_7", -1)
+                    line_number = _coerce_int(item.get("lineNumber", item.get("_6")), -1)
+                    line_number_end = _coerce_int(item.get("lineNumberEnd", item.get("_7")), -1)
                     
                     # Calculate number of lines
                     if line_number != -1 and line_number_end != -1:
@@ -99,16 +129,20 @@ class CodeBrowsingService:
                         number_of_lines = 0
 
                     methods.append({
-                        "name": item.get("_1", ""),
-                        "node_id": str(item.get("_2", "")),
-                        "fullName": item.get("_3", ""),
-                        "signature": item.get("_4", ""),
-                        "filename": item.get("_5", ""),
+                        "name": item.get("name", item.get("_1", "")),
+                        "node_id": str(item.get("node_id", item.get("_2", ""))),
+                        "fullName": item.get("fullName", item.get("_3", "")),
+                        "signature": item.get("signature", item.get("_4", "")),
+                        "filename": item.get("filename", item.get("_5", "")),
                         "lineNumber": line_number,
                         "lineNumberEnd": line_number_end,
-                        "cyclomaticComplexity": item.get("_8", 1),
+                        "cyclomaticComplexity": _coerce_int(
+                            item.get("cyclomaticComplexity", item.get("_8")), 1
+                        ),
                         "numberOfLines": number_of_lines,
-                        "isExternal": item.get("_9", False),
+                        "isExternal": _coerce_bool(
+                            item.get("isExternal", item.get("_9")), False
+                        ),
                     })
             return {"success": True, "methods": methods, "total": len(methods)}
 
@@ -154,6 +188,7 @@ class CodeBrowsingService:
             "caller_pattern": caller_pattern,
             "callee_pattern": callee_pattern,
             "limit": limit,
+            "result_format": _RESULT_FORMAT_VERSION,
         }
 
         def execute_query():
@@ -168,7 +203,9 @@ class CodeBrowsingService:
                 query_parts.append(f'.where(_.method.name("{escape_scala_string(caller_pattern)}"))')
 
             query_parts.append(
-                ".map(c => (c.method.name, c.name, c.code, c.method.filename, c.lineNumber.getOrElse(-1)))"
+                '.map(c => Map("caller" -> c.method.name, "callee" -> c.name, '
+                '"code" -> c.code, "filename" -> c.method.filename, '
+                '"lineNumber" -> c.lineNumber.getOrElse(-1).toString))'
             )
             
             query_limit = min(limit, 10000)
@@ -189,11 +226,13 @@ class CodeBrowsingService:
             for item in result.data:
                 if isinstance(item, dict):
                     calls.append({
-                        "caller": item.get("_1", ""),
-                        "callee": item.get("_2", ""),
-                        "code": item.get("_3", ""),
-                        "filename": item.get("_4", ""),
-                        "lineNumber": item.get("_5", -1),
+                        "caller": item.get("caller", item.get("_1", "")),
+                        "callee": item.get("callee", item.get("_2", "")),
+                        "code": item.get("code", item.get("_3", "")),
+                        "filename": item.get("filename", item.get("_4", "")),
+                        "lineNumber": _coerce_int(
+                            item.get("lineNumber", item.get("_5")), -1
+                        ),
                     })
             return {"success": True, "calls": calls, "total": len(calls)}
 
@@ -229,7 +268,11 @@ class CodeBrowsingService:
     ) -> Dict[str, Any]:
         
         validate_codebase_hash(codebase_hash)
-        cache_params = {"method_name": method_name}
+        cache_params = {
+            "method_name": method_name,
+            "limit": limit,
+            "result_format": _RESULT_FORMAT_VERSION,
+        }
 
         def execute_query():
             codebase_info = self.codebase_tracker.get_codebase(codebase_hash)
@@ -241,7 +284,9 @@ class CodeBrowsingService:
                 query_parts.append(f'.name("{escape_scala_string(method_name)}")')
             
             query_parts.append(
-                '.map(m => (m.name, m.parameter.map(p => (p.name, p.typeFullName, p.index)).l))'
+                '.map(m => Map("method" -> m.name, "parameters" -> '
+                'm.parameter.map(p => Map("name" -> p.name, "type" -> p.typeFullName, '
+                '"index" -> p.index.toString)).l))'
             )
             
             query = "".join(query_parts) + f".take({limit}).l"
@@ -259,17 +304,25 @@ class CodeBrowsingService:
 
             methods = []
             for item in result.data:
-                if isinstance(item, dict) and "_1" in item and "_2" in item:
+                if isinstance(item, dict) and (
+                    ("method" in item and "parameters" in item)
+                    or ("_1" in item and "_2" in item)
+                ):
                     params = []
-                    param_list = item.get("_2", [])
+                    param_list = item.get("parameters", item.get("_2", []))
                     for param_data in param_list:
                         if isinstance(param_data, dict):
                             params.append({
-                                "name": param_data.get("_1", ""),
-                                "type": param_data.get("_2", ""),
-                                "index": param_data.get("_3", -1),
+                                "name": param_data.get("name", param_data.get("_1", "")),
+                                "type": param_data.get("type", param_data.get("_2", "")),
+                                "index": _coerce_int(
+                                    param_data.get("index", param_data.get("_3")), -1
+                                ),
                             })
-                    methods.append({"method": item.get("_1", ""), "parameters": params})
+                    methods.append({
+                        "method": item.get("method", item.get("_1", "")),
+                        "parameters": params,
+                    })
             return {"success": True, "methods": methods, "total": len(methods)}
 
         return self._get_cached_or_execute("list_parameters", codebase_hash, cache_params, execute_query)
@@ -286,6 +339,8 @@ class CodeBrowsingService:
         cache_params = {
             "pattern": pattern,
             "literal_type": literal_type,
+            "limit": limit,
+            "result_format": _RESULT_FORMAT_VERSION,
         }
 
         def execute_query():
@@ -300,7 +355,10 @@ class CodeBrowsingService:
                 query_parts.append(f'.typeFullName(".*{escape_scala_string(literal_type)}.*")')
 
             query_parts.append(
-                ".map(lit => (lit.code, lit.typeFullName, lit.filename, lit.lineNumber.getOrElse(-1), lit.method.name))"
+                '.map(lit => Map("value" -> lit.code, "type" -> lit.typeFullName, '
+                '"filename" -> lit.filename, '
+                '"lineNumber" -> lit.lineNumber.getOrElse(-1).toString, '
+                '"method" -> lit.method.name))'
             )
             
             query = "".join(query_parts) + f".take({limit}).l"
@@ -320,11 +378,13 @@ class CodeBrowsingService:
             for item in result.data:
                 if isinstance(item, dict):
                     literals.append({
-                        "value": item.get("_1", ""),
-                        "type": item.get("_2", ""),
-                        "filename": item.get("_3", ""),
-                        "lineNumber": item.get("_4", -1),
-                        "method": item.get("_5", ""),
+                        "value": item.get("value", item.get("_1", "")),
+                        "type": item.get("type", item.get("_2", "")),
+                        "filename": item.get("filename", item.get("_3", "")),
+                        "lineNumber": _coerce_int(
+                            item.get("lineNumber", item.get("_4")), -1
+                        ),
+                        "method": item.get("method", item.get("_5", "")),
                     })
             return {"success": True, "literals": literals, "total": len(literals)}
 

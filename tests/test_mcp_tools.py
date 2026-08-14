@@ -268,6 +268,7 @@ class TestMCPTools:
         mock_services["codebase_tracker"].get_codebase.return_value = None
 
         with patch("src.tools.core_tools.resolve_host_path", return_value=str(source_dir)), \
+             patch("src.tools.core_tools._fingerprint_local_source", return_value="a" * 64), \
              patch("src.tools.core_tools._get_git_commit_hash", return_value=None), \
              patch("src.tools.core_tools.os.path.abspath", return_value=str(tmp_path)), \
              patch("src.tools.core_tools.os.path.dirname", return_value=str(tmp_path)), \
@@ -294,6 +295,112 @@ class TestMCPTools:
                 assert result_dict["success"] is False
                 assert result_dict["error"] == "Failed to copy local source directory"
                 assert str(source_dir) not in result_dict["error"]
+
+    @pytest.mark.asyncio
+    async def test_generate_cpg_fingerprint_failure_stops_before_cache_or_copy(
+        self, mock_services, tmp_path
+    ):
+        """A local refresh must fail closed when its source cannot be fingerprinted."""
+        from src.tools.core_tools import register_core_tools
+
+        source_dir = tmp_path / "private-repo"
+        source_dir.mkdir()
+        mock_services["config"].cpg.large_project_guard = False
+        mock_services["codebase_tracker"].get_codebase.return_value = None
+
+        with patch(
+            "src.tools.core_tools._fingerprint_local_source",
+            side_effect=OSError(f"permission denied: {source_dir}"),
+        ), patch("src.tools.core_tools.get_cpg_cache_key") as cache_key, patch(
+            "src.tools.core_tools._copy_local_source_tree"
+        ) as copy_source:
+            mcp = FastMCP("TestServer")
+            register_core_tools(mcp, mock_services)
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "generate_cpg",
+                    {
+                        "source_type": "local",
+                        "source_path": str(source_dir),
+                        "language": "c",
+                    },
+                )
+
+        import json
+
+        result_dict = json.loads(result.content[0].text)
+        assert result_dict["success"] is False
+        assert "failed to fingerprint local source" in result_dict["error"].lower()
+        assert "safe cache reuse" in result_dict["error"].lower()
+        assert str(source_dir) not in result_dict["error"]
+        cache_key.assert_not_called()
+        copy_source.assert_not_called()
+        mock_services["codebase_tracker"].get_codebase.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_generate_cpg_passes_all_graph_options_to_cache_identity(
+        self, mock_services, tmp_path
+    ):
+        """The tool must key the same normalized options it submits to Joern."""
+        from src.tools.core_tools import register_core_tools
+
+        codebase_hash = "abc1234567890123"
+        cached_cpg = tmp_path / "cached.bin"
+        cached_cpg.write_text("cpg")
+        mock_services["config"].cpg.large_project_guard = False
+        mock_services["codebase_tracker"].get_codebase.return_value = CodebaseInfo(
+            codebase_hash=codebase_hash,
+            source_type="local",
+            source_path=str(tmp_path),
+            language="c",
+            cpg_path=str(cached_cpg),
+            joern_port=2000,
+            metadata={"status": "ready"},
+        )
+        mock_services["joern_server_manager"].is_server_running.return_value = True
+        build_spec = {"canonical": "build-spec"}
+
+        with patch(
+            "src.tools.core_tools._fingerprint_local_source", return_value="f" * 64
+        ), patch(
+            "src.tools.core_tools._get_cpg_build_spec", return_value=build_spec
+        ) as build_spec_mock, patch(
+            "src.tools.core_tools.get_cpg_cache_key", return_value=codebase_hash
+        ) as cache_key_mock:
+            mcp = FastMCP("TestServer")
+            register_core_tools(mcp, mock_services)
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "generate_cpg",
+                    {
+                        "source_type": "local",
+                        "source_path": str(tmp_path),
+                        "language": "c",
+                        "include_paths": [" include ", "generated"],
+                        "defines": [" FEATURE=1 "],
+                        "include_globs": [" src/** "],
+                        "auto_system_headers": True,
+                        "compile_commands": " build/compile_commands.json ",
+                    },
+                )
+
+        import json
+
+        result_dict = json.loads(result.content[0].text)
+        assert result_dict["status"] == "ready"
+        assert build_spec_mock.call_args.kwargs == {
+            "language": "c",
+            "config": mock_services["config"],
+            "include_paths": ["include", "generated"],
+            "defines": ["FEATURE=1"],
+            "include_globs": ["src/**"],
+            "auto_system_headers": True,
+            "compile_commands": "build/compile_commands.json",
+        }
+        assert cache_key_mock.call_args.kwargs["content"] == "f" * 64
+        assert cache_key_mock.call_args.kwargs["build_spec"] is build_spec
 
     @pytest.mark.asyncio
     async def test_generate_cpg_rejects_playground_self_inclusion(self, mock_services):

@@ -1,12 +1,19 @@
-"""Tests for get_cpg_cache_key — branch, build-options (extra), and content keying.
+"""Tests for versioned CPG cache identity and content keying.
 
 Covers the cache-key changes:
   - github/gitlab `branch` is part of the key (two branches must not collide)
-  - caller build options (`extra`: include paths / defines) are part of the key
+  - every effective graph-shaping option is part of the key
   - local sources key on a content fingerprint (dedupe across paths; rebuild on change)
+  - local sources fail closed when no fingerprint is available
 """
 
-from src.tools.core_tools import get_cpg_cache_key
+from types import SimpleNamespace
+
+import pytest
+
+import src.tools.core_tools as core_tools
+from src.exceptions import ValidationError
+from src.tools.core_tools import _get_cpg_build_spec, get_cpg_cache_key
 
 GH = "https://github.com/owner/repo"
 GL = "https://gitlab.com/group/sub/repo"
@@ -63,11 +70,10 @@ def test_local_content_change_rebuilds():
     assert a != b
 
 
-def test_local_without_content_is_path_based():
-    """Fallback when fingerprinting unavailable: distinct paths => distinct keys."""
-    a = get_cpg_cache_key("local", "/path/one", "c")
-    b = get_cpg_cache_key("local", "/path/two", "c")
-    assert a != b
+def test_local_without_content_fails_closed():
+    """A path alone can never authorize reuse of a local cached CPG."""
+    with pytest.raises(ValidationError, match="verified source fingerprint"):
+        get_cpg_cache_key("local", "/path/one", "c")
 
 
 def test_commit_hash_changes_key():
@@ -89,3 +95,85 @@ def test_key_is_16_hex_chars():
     k = get_cpg_cache_key("github", GH, "c", branch="x")
     assert len(k) == 16
     int(k, 16)  # raises if not hex
+
+
+def _config(*, autodetect=False, patterns=None, languages=None):
+    return SimpleNamespace(
+        cpg=SimpleNamespace(
+            autodetect_compile_db=autodetect,
+            exclusion_patterns=list(patterns or []),
+            languages_with_exclusions=list(languages or []),
+        )
+    )
+
+
+def _local_key(build_spec):
+    return get_cpg_cache_key(
+        "local",
+        "/src",
+        "c",
+        content="source-fingerprint",
+        build_spec=build_spec,
+    )
+
+
+def test_cache_format_epoch_invalidates_old_namespace(monkeypatch):
+    before = get_cpg_cache_key("local", "/src", "c", content="same")
+    monkeypatch.setattr(
+        core_tools, "CPG_CACHE_FORMAT_VERSION", "cpg-cache-v-next"
+    )
+    after = get_cpg_cache_key("local", "/src", "c", content="same")
+    assert before != after
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"include_paths": ["include"]},
+        {"defines": ["FEATURE=1"]},
+        {"include_globs": ["src/**"]},
+        {"auto_system_headers": True},
+        {"compile_commands": "build/compile_commands.json"},
+    ],
+)
+def test_each_caller_graph_option_changes_cache_identity(changed):
+    config = _config(autodetect=False)
+    base = _get_cpg_build_spec("c", config=config)
+    variant = _get_cpg_build_spec("c", config=config, **changed)
+    assert _local_key(base) != _local_key(variant)
+
+
+def test_compile_database_autodetection_behavior_changes_identity():
+    disabled = _get_cpg_build_spec("c", config=_config(autodetect=False))
+    enabled = _get_cpg_build_spec("c", config=_config(autodetect=True))
+    assert disabled["compile_database"] == {"mode": "none", "path": None}
+    assert enabled["compile_database"] == {"mode": "auto", "path": None}
+    assert _local_key(disabled) != _local_key(enabled)
+
+
+def test_effective_exclusions_change_cache_identity():
+    disabled = _get_cpg_build_spec(
+        "c", config=_config(patterns=[r"tests/.*"], languages=[])
+    )
+    enabled = _get_cpg_build_spec(
+        "c", config=_config(patterns=[r"tests/.*"], languages=["c"])
+    )
+    changed = _get_cpg_build_spec(
+        "c", config=_config(patterns=[r"vendor/.*"], languages=["c"])
+    )
+
+    assert disabled["exclusions"] == {"enabled": False, "patterns": []}
+    assert _local_key(disabled) != _local_key(enabled)
+    assert _local_key(enabled) != _local_key(changed)
+
+
+def test_order_sensitive_build_options_preserve_order_in_identity():
+    config = _config(autodetect=False)
+    first = _get_cpg_build_spec(
+        "c", config=config, include_paths=["first", "second"]
+    )
+    second = _get_cpg_build_spec(
+        "c", config=config, include_paths=["second", "first"]
+    )
+    assert first["include_paths"] == ["first", "second"]
+    assert _local_key(first) != _local_key(second)

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import docker
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 REDACTED_HOST_PATH = "<redacted:host-path>"
 REDACTED_CONTAINER_PATH = "<redacted:container-path>"
 REDACTED_LOCAL_SOURCE = "<redacted:local-source>"
+
+# Cache schema epoch. Bump this only when the inputs or semantics used to build a
+# CPG change. The v2 namespace intentionally prevents pre-v2 cache entries (whose
+# keys omitted several graph-shaping inputs) from being reused.
+CPG_CACHE_FORMAT_VERSION = "cpg-cache-v2"
 
 
 def _public_source_path(source_type: str, source_path: Optional[str]) -> Optional[str]:
@@ -482,64 +488,152 @@ def _sanitize_build_opt_list(items, kind: str) -> list:
     return out
 
 
-def get_cpg_cache_key(source_type: str, source_path: str, language: str, commit_hash: Optional[str] = None, content: Optional[str] = None, extra: Optional[str] = None, branch: Optional[str] = None) -> str:
-    """
-    Generate a deterministic CPG cache key based on source type, path, language, and optional commit hash.
+def _get_cpg_build_spec(
+    language: str,
+    config=None,
+    include_paths: Optional[list] = None,
+    defines: Optional[list] = None,
+    include_globs: Optional[list] = None,
+    auto_system_headers: bool = False,
+    compile_commands: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return the canonical set of effective inputs that shape a CPG.
 
-    For snippets the key is derived from the code content (not the path), so pasting
-    the same snippet twice reuses the cached CPG regardless of the label.
+    Lists deliberately retain caller order. Include-path order affects header
+    resolution, and repeated defines can be order-sensitive. The source
+    fingerprint covers auto-discovered include roots and the contents of an
+    explicit or auto-detected compilation database; this spec records which
+    database-selection behavior is active and, for an explicit database, its
+    source-relative identity.
+    """
+    cpg_config = getattr(config, "cpg", None) if config else None
+
+    include_supported = frontend_supports(language, "include")
+    define_supported = frontend_supports(language, "define")
+    scope_supported = frontend_supports(language, "exclude_regex")
+    system_headers_supported = frontend_supports(
+        language, "auto_include_discovery"
+    )
+    compile_db_supported = frontend_supports(language, "compilation_database")
+
+    requested_compile_db = (
+        str(compile_commands).strip().lstrip("/") if compile_commands else None
+    )
+    autodetect_compile_db = bool(
+        compile_db_supported
+        and not requested_compile_db
+        and (
+            cpg_config is None
+            or getattr(cpg_config, "autodetect_compile_db", True)
+        )
+    )
+    if compile_db_supported and requested_compile_db:
+        compile_database = {
+            "mode": "explicit",
+            "path": requested_compile_db,
+        }
+    elif autodetect_compile_db:
+        compile_database = {"mode": "auto", "path": None}
+    else:
+        compile_database = {"mode": "none", "path": None}
+
+    configured_patterns = list(
+        (getattr(cpg_config, "exclusion_patterns", None) or [])
+        if cpg_config
+        else []
+    )
+    exclusion_languages = set(
+        (getattr(cpg_config, "languages_with_exclusions", None) or [])
+        if cpg_config
+        else []
+    )
+    exclusions_enabled = bool(
+        configured_patterns and language in exclusion_languages
+    )
+
+    return {
+        "language": language,
+        "include_paths": list(include_paths or []) if include_supported else [],
+        "defines": list(defines or []) if define_supported else [],
+        "include_globs": list(include_globs or []) if scope_supported else [],
+        "auto_system_headers": bool(
+            auto_system_headers and system_headers_supported
+        ),
+        "compile_database": compile_database,
+        "exclusions": {
+            "enabled": exclusions_enabled,
+            "patterns": configured_patterns if exclusions_enabled else [],
+        },
+    }
+
+
+def get_cpg_cache_key(
+    source_type: str,
+    source_path: str,
+    language: str,
+    commit_hash: Optional[str] = None,
+    content: Optional[str] = None,
+    extra: Optional[str] = None,
+    branch: Optional[str] = None,
+    build_spec: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Generate a versioned, deterministic cache key for a CPG build.
+
+    Local sources must supply a verified content fingerprint. There is
+    intentionally no path-only fallback: without a fingerprint, cache reuse
+    cannot prove that the graph matches the requested source tree.
+
+    ``extra`` remains supported for callers of the old helper API, but production
+    generation uses the structured ``build_spec`` so every graph-shaping option
+    is represented without delimiter ambiguity.
     """
     if source_type == "snippet":
         digest = hashlib.sha256((content or "").encode("utf-8")).hexdigest()
-        identifier = f"snippet:{digest}:{language}"
-        return hashlib.sha256(identifier.encode()).hexdigest()[:16]
+        source_identity = {"type": "snippet", "content_sha256": digest}
     elif source_type == "github":
         if "github.com/" in source_path:
             parts = source_path.split("github.com/")[-1].split("/")
             if len(parts) >= 2:
                 owner = parts[0]
                 repo = parts[1].replace(".git", "")
-                identifier = f"github:{owner}/{repo}:{language}"
+                repository = f"github:{owner}/{repo}"
             else:
-                identifier = f"github:{source_path}:{language}"
+                repository = f"github:{source_path}"
         elif "gitlab.com/" in source_path:
-            # gitlab supports nested groups, so the project path can be deeper
-            # than owner/repo — key off the whole path (sans trailing .git) so
-            # the hash is stable and collision-free across subgroups.
             path = source_path.split("gitlab.com/")[-1].strip("/")
             if path.endswith(".git"):
                 path = path[:-4]
-            identifier = f"gitlab:{path}:{language}"
+            repository = f"gitlab:{path}"
         else:
-            identifier = f"github:{source_path}:{language}"
+            repository = f"github:{source_path}"
+        source_identity = {
+            "type": "remote",
+            "repository": repository,
+            "branch": branch,
+            "commit": commit_hash,
+        }
     else:
-        if content:
-            # Content fingerprint: identical trees dedupe regardless of path, and
-            # any content change yields a new key (no stale-CPG reuse). See
-            # _fingerprint_local_source.
-            identifier = f"local:{language}:{content}"
-        else:
-            # Fallback when fingerprinting is unavailable: path-based key.
-            source_path = os.path.abspath(source_path)
-            identifier = f"local:{source_path}:{language}"
+        if not content:
+            raise ValidationError(
+                "A verified source fingerprint is required for local CPG cache identity"
+            )
+        source_identity = {"type": "local", "content_sha256": content}
 
-    # A requested branch selects a distinct revision of a remote repo, so it must be
-    # part of the key — otherwise two branches of the same repo collide on one CPG
-    # (and the second request silently reuses the first branch's graph). Only applies
-    # to remote sources; default branch (None) leaves the key unchanged for back-compat.
-    if branch and source_type == "github":
-        identifier += f"@{branch}"
-
-    if commit_hash:
-        identifier += f":{commit_hash}"
-
-    # Build options (caller-supplied include paths / defines) change the produced CPG,
-    # so they must be part of the cache key or a stale CPG would be reused.
+    identity = {
+        "cache_format": CPG_CACHE_FORMAT_VERSION,
+        "source": source_identity,
+        "build": build_spec or {"language": language},
+    }
     if extra:
-        identifier += f":{extra}"
+        identity["legacy_extra"] = extra
 
-    hash_digest = hashlib.sha256(identifier.encode()).hexdigest()[:16]
-    return hash_digest
+    canonical = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def get_cpg_cache_path(cache_key: str, playground_path: str) -> str:
@@ -767,6 +861,61 @@ def _joern_helper_image() -> str:
         )
 
 
+def _scan_repo_via_daemon(host_path: str) -> tuple:
+    """Measure a host-only source tree through a read-only helper container."""
+    clean = host_path.rstrip("/")
+    parent, base = os.path.dirname(clean), os.path.basename(clean)
+    if not parent or not base:
+        raise ValidationError("Invalid host source path")
+
+    src = "/src/" + shlex.quote(base)
+    prune_dirs = (
+        "\\( -name .git -o -name .svn -o -name .hg -o -name .idea "
+        "-o -name .vscode -o -name node_modules -o -name __pycache__ \\)"
+    )
+    source_names = (
+        "\\( -name '*.c' -o -name '*.cpp' -o -name '*.cc' -o -name '*.cxx' "
+        "-o -name '*.h' -o -name '*.hpp' -o -name '*.hxx' -o -name '*.java' "
+        "-o -name '*.kt' -o -name '*.kts' -o -name '*.scala' -o -name '*.py' "
+        "-o -name '*.js' -o -name '*.ts' -o -name '*.jsx' -o -name '*.tsx' "
+        "-o -name '*.go' -o -name '*.cs' -o -name '*.php' -o -name '*.rb' "
+        "-o -name '*.swift' -o -name '*.rs' -o -name '*.sh' -o -name '*.bash' "
+        "-o -name '*.xml' -o -name '*.json' -o -name '*.yaml' -o -name '*.yml' \\)"
+    )
+    script = (
+        "set -e; "
+        f"cd {src}; "
+        f"bytes=$(find . -type d {prune_dirs} -prune -o -type f -printf '%s\\n' "
+        "| awk '{sum += $1} END {print sum + 0}'); "
+        f"loc=$(find . -type d {prune_dirs} -prune -o -type f {source_names} -print0 "
+        "| xargs -0 -r -n 1 wc -l | awk '{sum += $1} END {print sum + 0}'); "
+        'printf "%s %s\\n" "$bytes" "$loc"'
+    )
+    client = docker.from_env()
+    try:
+        out = client.containers.run(
+            image=_joern_helper_image(),
+            entrypoint=["/bin/sh", "-c", script],
+            volumes={parent: {"bind": "/src", "mode": "ro"}},
+            remove=True,
+            network_disabled=True,
+        )
+    except (docker.errors.ContainerError, docker.errors.APIError):
+        raise ValidationError(
+            "Failed to scan host source; check that the path exists and is readable"
+        )
+
+    text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+    parts = text.strip().split()
+    if len(parts) != 2:
+        raise ValidationError("Invalid size result from host-source helper")
+    try:
+        total_bytes, total_lines = (int(value) for value in parts)
+    except ValueError:
+        raise ValidationError("Invalid size result from host-source helper")
+    return int(total_bytes / (1024 * 1024)), total_lines
+
+
 def _hash_tree_in_process(root: str) -> str:
     """Deterministic content fingerprint of a directory tree (this process reads it).
 
@@ -834,12 +983,13 @@ def _fingerprint_local_source_via_daemon(host_path: str) -> str:
     return digest
 
 
-def _fingerprint_local_source(source_path: str) -> Optional[str]:
+def _fingerprint_local_source(source_path: str) -> str:
     """Content fingerprint for a local source, used as the CPG cache key.
 
     Reads the tree in-process when it is visible (MCP on host / bind-mounted),
     else computes it on the host via a helper container (containerized MCP).
-    Returns None on failure so the caller can fall back to path-based keying.
+    Raises on failure. A local refresh must never reuse a cache entry without a
+    verified source fingerprint.
     """
     host_path = resolve_host_path(source_path, require_local_access=False)
     if os.path.exists(host_path):
@@ -1827,8 +1977,15 @@ Examples:
             if source_type == "local" and not force and guard_on:
                 max_mb = config.cpg.large_project_max_mb if config else 2000
                 max_loc = config.cpg.large_project_max_loc if config else 2_000_000
-                resolved = await asyncio.to_thread(resolve_host_path, source_path)
-                size_mb, loc = await asyncio.to_thread(_scan_repo, resolved)
+                resolved = await asyncio.to_thread(
+                    resolve_host_path, source_path, False
+                )
+                if os.path.exists(resolved):
+                    size_mb, loc = await asyncio.to_thread(_scan_repo, resolved)
+                else:
+                    size_mb, loc = await asyncio.to_thread(
+                        _scan_repo_via_daemon, resolved
+                    )
                 if size_mb > max_mb or loc > max_loc:
                     return {
                         "success": True,  # no error; an informational soft-decline
@@ -1854,31 +2011,51 @@ Examples:
                     # Content fingerprint of the tree (works for non-git sources and
                     # for a containerized MCP that can't read the host path directly).
                     content_fp = await asyncio.to_thread(_fingerprint_local_source, source_path)
-                    if content_fp:
-                        logger.info(f"Local source content fingerprint: {content_fp[:16]}")
+                    if not content_fp:
+                        raise ValidationError("Fingerprint helper returned no digest")
+                    logger.info(f"Local source content fingerprint: {content_fp[:16]}")
                 except Exception as e:
-                    logger.warning(
-                        f"Failed to fingerprint local source ({e}); falling back to path-based key"
+                    logger.error(
+                        f"Failed to fingerprint local source; refresh aborted: {e}",
+                        exc_info=True,
                     )
-                    content_fp = None
+                    raise ValidationError(
+                        "Failed to fingerprint local source; CPG refresh was not started "
+                        "because safe cache reuse could not be verified"
+                    ) from e
 
-            # Normalize + validate C/C++ build options (no control chars; relative
-            # include paths must stay within the source root). Build options are part
-            # of the cache key so a different -I/-D set yields a distinct CPG.
+            # Normalize every caller-controlled graph-shaping list before both keying
+            # and execution so the cache identity matches the effective build.
             include_paths = _sanitize_build_opt_list(include_paths, "include path")
             defines = _sanitize_build_opt_list(defines, "define")
+            include_globs = _sanitize_build_opt_list(include_globs, "include glob")
+            _compile_commands = _sanitize_build_opt_list(
+                [compile_commands] if compile_commands else [],
+                "compile_commands path",
+            )
+            compile_commands = _compile_commands[0] if _compile_commands else None
             if (include_paths or defines) and language not in ("c", "cpp"):
                 logger.warning(f"include_paths/defines ignored for language '{language}' (C/C++ only)")
                 include_paths, defines = [], []
 
-            _opts = []
-            if include_paths:
-                _opts.append("inc=" + ",".join(sorted(include_paths)))
-            if defines:
-                _opts.append("def=" + ",".join(sorted(defines)))
-            build_opts_key = ";".join(_opts) if _opts else None
-
-            codebase_hash = get_cpg_cache_key(source_type, source_path, language, commit_hash, content=content_fp, extra=build_opts_key, branch=branch)
+            build_spec = _get_cpg_build_spec(
+                language=language,
+                config=config,
+                include_paths=include_paths,
+                defines=defines,
+                include_globs=include_globs,
+                auto_system_headers=auto_system_headers,
+                compile_commands=compile_commands,
+            )
+            codebase_hash = get_cpg_cache_key(
+                source_type,
+                source_path,
+                language,
+                commit_hash,
+                content=content_fp,
+                branch=branch,
+                build_spec=build_spec,
+            )
             logger.info(f"Processing codebase with hash: {codebase_hash}")
 
             existing_codebase = codebase_tracker.get_codebase(codebase_hash)

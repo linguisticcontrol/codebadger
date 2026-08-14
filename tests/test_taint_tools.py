@@ -122,6 +122,7 @@ async def test_find_taint_sources_with_filename_filter(fake_services):
         assert query_executor.last_query is not None
         assert "where(_.file.name" in query_executor.last_query
         assert "shell" in query_executor.last_query
+        assert ".map(c => Map(" in query_executor.last_query
 
 
 def test_query_loader_escapes_scala_string_values():
@@ -202,6 +203,7 @@ async def test_find_taint_sinks_with_filename_filter(fake_services):
         assert query_executor.last_query is not None
         assert "where(_.file.name" in query_executor.last_query
         assert "main" in query_executor.last_query
+        assert ".map(c => Map(" in query_executor.last_query
 
 
 @pytest.mark.asyncio

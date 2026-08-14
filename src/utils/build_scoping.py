@@ -19,6 +19,34 @@ the call targets you care about.
 import re
 from typing import List, Optional
 
+from ..exceptions import ValidationError
+
+
+def normalize_path_globs(globs: Optional[List[str]], kind: str) -> Optional[List[str]]:
+    """Validate and canonicalize repo-relative POSIX glob sets."""
+    if globs is None:
+        return None
+    normalized = set()
+    for raw in globs:
+        value = str(raw).strip()
+        if not value:
+            continue
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+            raise ValidationError(f"Invalid {kind}: control characters not allowed")
+        if "\\" in value:
+            raise ValidationError(f"Invalid {kind}: use '/' as the path separator")
+        if value.startswith("./"):
+            value = value[2:]
+        if not value or value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+            raise ValidationError(f"Invalid {kind}: value must be relative to the source root")
+        segments = value.rstrip("/").split("/")
+        if any(segment in ("", ".", "..") for segment in segments):
+            raise ValidationError(f"Invalid {kind}: '.', '..', and empty path segments are not allowed")
+        if "***" in value:
+            raise ValidationError(f"Invalid {kind}: malformed '**' wildcard")
+        normalized.add(value)
+    return sorted(normalized)
+
 
 def glob_to_path_regex(glob: str) -> str:
     """Translate a path glob to a full-match regex against a relative path.
@@ -28,7 +56,9 @@ def glob_to_path_regex(glob: str) -> str:
     prefix (keeps everything beneath it). A trailing ``/`` is also a directory.
     All other characters are regex-escaped.
     """
-    g = glob.strip().lstrip("./")
+    g = glob.strip()
+    if g.startswith("./"):
+        g = g[2:]
     if not g:
         return ""
 
@@ -42,7 +72,7 @@ def glob_to_path_regex(glob: str) -> str:
     while i < len(g):
         if g.startswith("**/", i):
             # zero-or-more leading directories (so **/*.c also matches root files)
-            out.append("(?:.*/)?")
+            out.append("(.*/)?")
             i += 3
         elif g.startswith("**", i):
             out.append(".*")
@@ -61,6 +91,20 @@ def glob_to_path_regex(glob: str) -> str:
         # Keep the directory's whole subtree.
         regex = regex + "/.*"
     return regex
+
+
+def path_matches_globs(path: str, globs: List[str], *, is_dir: bool = False) -> bool:
+    """Return whether a repo-relative POSIX path matches a normalized glob."""
+    relative = str(path).replace("\\", "/")
+    if relative.startswith("./"):
+        relative = relative[2:]
+    candidates = [relative, relative.rstrip("/") + "/"] if is_dir else [relative]
+    return any(
+        re.fullmatch(regex, candidate) is not None
+        for glob in globs
+        if (regex := glob_to_path_regex(glob))
+        for candidate in candidates
+    )
 
 
 def scope_exclude_regex(include_globs: List[str], source_exts: List[str]) -> Optional[str]:
@@ -83,6 +127,16 @@ def scope_exclude_regex(include_globs: List[str], source_exts: List[str]) -> Opt
     # Full-match (.matches) anchored: must be a source file (positive lookahead)
     # AND not in scope (negative lookahead), then consume the whole path.
     return f"(?=.*\\.(?:{ext_alt})$)(?!(?:{keep_alt})$).*"
+
+
+def exclude_globs_regex(exclude_globs: List[str], source_exts: List[str]) -> Optional[str]:
+    """Exclude matching source translation units while retaining support files."""
+    drops = [r for r in (glob_to_path_regex(g) for g in exclude_globs) if r]
+    exts = [re.escape(e.lstrip(".")) for e in source_exts if e and e.strip()]
+    if not drops or not exts:
+        return None
+    drop_alt = "|".join(f"(?:{r})" for r in drops)
+    return f"(?=.*\\.(?:{'|'.join(exts)})$)(?:{drop_alt})"
 
 
 def combine_exclude_regexes(parts: List[Optional[str]]) -> Optional[str]:

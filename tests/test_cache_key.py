@@ -177,3 +177,27 @@ def test_order_sensitive_build_options_preserve_order_in_identity():
     )
     assert first["include_paths"] == ["first", "second"]
     assert _local_key(first) != _local_key(second)
+
+
+def test_source_view_policy_changes_cache_identity():
+    config = _config(
+        autodetect=False,
+        patterns=[r"(?:^|.*/)tool.*/.*"],
+        languages=["c"],
+    )
+    inherited = _get_cpg_build_spec(
+        "c", config=config, exclude_globs=None, ignore_globs=[]
+    )
+    no_defaults = _get_cpg_build_spec(
+        "c", config=config, exclude_globs=[], ignore_globs=[]
+    )
+    ignored_worktree = _get_cpg_build_spec(
+        "c", config=config, exclude_globs=[], ignore_globs=[".work/**"]
+    )
+    assert inherited["exclude_globs"] is None
+    assert no_defaults["exclude_globs"] == []
+    assert len({
+        _local_key(inherited),
+        _local_key(no_defaults),
+        _local_key(ignored_worktree),
+    }) == 3

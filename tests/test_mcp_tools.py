@@ -381,6 +381,8 @@ class TestMCPTools:
                         "include_paths": [" include ", "generated"],
                         "defines": [" FEATURE=1 "],
                         "include_globs": [" src/** "],
+                        "exclude_globs": [" tests/** ", "tests/**"],
+                        "ignore_globs": [" generated/** ", ".work/**"],
                         "auto_system_headers": True,
                         "compile_commands": " build/compile_commands.json ",
                     },
@@ -396,11 +398,42 @@ class TestMCPTools:
             "include_paths": ["include", "generated"],
             "defines": ["FEATURE=1"],
             "include_globs": ["src/**"],
+            "exclude_globs": ["tests/**"],
+            "ignore_globs": [".work/**", "generated/**"],
             "auto_system_headers": True,
             "compile_commands": "build/compile_commands.json",
         }
         assert cache_key_mock.call_args.kwargs["content"] == "f" * 64
         assert cache_key_mock.call_args.kwargs["build_spec"] is build_spec
+
+    @pytest.mark.asyncio
+    async def test_generate_cpg_rejects_ignored_explicit_compile_database(
+        self, mock_services, tmp_path
+    ):
+        from src.tools.core_tools import register_core_tools
+        import json
+
+        source_dir = tmp_path / "source"
+        source_dir.mkdir()
+        mock_services["config"].cpg.large_project_guard = False
+        mock_services["codebase_tracker"].get_codebase.return_value = None
+
+        with patch("src.tools.core_tools._fingerprint_local_source") as fingerprint:
+            mcp = FastMCP("TestServer")
+            register_core_tools(mcp, mock_services)
+            async with Client(mcp) as client:
+                result = await client.call_tool("generate_cpg", {
+                    "source_type": "local",
+                    "source_path": str(source_dir),
+                    "language": "cpp",
+                    "compile_commands": "build/compile_commands.json",
+                    "ignore_globs": ["build/**"],
+                })
+
+        result_dict = json.loads(result.content[0].text)
+        assert result_dict["success"] is False
+        assert "excluded by ignore_globs" in result_dict["error"]
+        fingerprint.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_generate_cpg_rejects_playground_self_inclusion(self, mock_services):

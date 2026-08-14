@@ -29,7 +29,10 @@ from ..defaults import (
     frontend_supports,
 )
 from ..exceptions import ValidationError
-from ..utils.build_scoping import combine_exclude_regexes, scope_exclude_regex
+from ..utils.build_scoping import (
+    combine_exclude_regexes, exclude_globs_regex, glob_to_path_regex,
+    normalize_path_globs, path_matches_globs, scope_exclude_regex,
+)
 from ..utils.compile_db import find_compile_db, prepare_container_compile_db
 from ..models import CodebaseInfo, SessionStatus
 from ..utils.validators import (
@@ -55,9 +58,9 @@ REDACTED_CONTAINER_PATH = "<redacted:container-path>"
 REDACTED_LOCAL_SOURCE = "<redacted:local-source>"
 
 # Cache schema epoch. Bump this only when the inputs or semantics used to build a
-# CPG change. The v2 namespace intentionally prevents pre-v2 cache entries (whose
+# CPG change. The v3 namespace prevents older cache entries (whose
 # keys omitted several graph-shaping inputs) from being reused.
-CPG_CACHE_FORMAT_VERSION = "cpg-cache-v2"
+CPG_CACHE_FORMAT_VERSION = "cpg-cache-v3"
 
 
 def _public_source_path(source_type: str, source_path: Optional[str]) -> Optional[str]:
@@ -488,12 +491,29 @@ def _sanitize_build_opt_list(items, kind: str) -> list:
     return out
 
 
+def _normalize_compile_commands_path(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        paths = normalize_path_globs([value], "compile_commands path") or []
+    except ValidationError as exc:
+        raise ValidationError(
+            "compile_commands must be a repository-relative POSIX path; "
+            "external compilation databases are unsupported"
+        ) from exc
+    if len(paths) != 1 or paths[0].endswith("/") or "*" in paths[0] or "?" in paths[0]:
+        raise ValidationError("compile_commands must name one file inside the source root")
+    return paths[0]
+
+
 def _get_cpg_build_spec(
     language: str,
     config=None,
     include_paths: Optional[list] = None,
     defines: Optional[list] = None,
     include_globs: Optional[list] = None,
+    exclude_globs: Optional[list] = None,
+    ignore_globs: Optional[list] = None,
     auto_system_headers: bool = False,
     compile_commands: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -548,7 +568,7 @@ def _get_cpg_build_spec(
         else []
     )
     exclusions_enabled = bool(
-        configured_patterns and language in exclusion_languages
+        exclude_globs is None and configured_patterns and language in exclusion_languages
     )
 
     return {
@@ -556,6 +576,8 @@ def _get_cpg_build_spec(
         "include_paths": list(include_paths or []) if include_supported else [],
         "defines": list(defines or []) if define_supported else [],
         "include_globs": list(include_globs or []) if scope_supported else [],
+        "exclude_globs": None if exclude_globs is None else list(exclude_globs),
+        "ignore_globs": list(ignore_globs or []),
         "auto_system_headers": bool(
             auto_system_headers and system_headers_supported
         ),
@@ -565,6 +587,37 @@ def _get_cpg_build_spec(
             "patterns": configured_patterns if exclusions_enabled else [],
         },
     }
+
+
+def _build_frontend_exclude_regex(
+    language: str,
+    config=None,
+    include_globs: Optional[list] = None,
+    exclude_globs: Optional[list] = None,
+) -> Optional[str]:
+    """Resolve inherited or explicit translation-unit selection."""
+    if not frontend_supports(language, "exclude_regex"):
+        return None
+    source_exts = SCOPE_SOURCE_EXTENSIONS.get(
+        language, [LANGUAGE_EXTENSIONS.get(language, language)]
+    )
+    parts = []
+    if exclude_globs is None:
+        cpg = getattr(config, "cpg", None) if config else None
+        if cpg and language in (cpg.languages_with_exclusions or []) and cpg.exclusion_patterns:
+            patterns = []
+            for pattern in cpg.exclusion_patterns:
+                try:
+                    re.compile(pattern)
+                    patterns.append(pattern)
+                except re.error:
+                    patterns.append(re.escape(pattern))
+            parts.append("|".join(f"({pattern})" for pattern in patterns))
+    elif exclude_globs:
+        parts.append(exclude_globs_regex(list(exclude_globs), source_exts))
+    if include_globs:
+        parts.append(scope_exclude_regex(list(include_globs), source_exts))
+    return combine_exclude_regexes(parts)
 
 
 def get_cpg_cache_key(
@@ -653,7 +706,7 @@ _TEXT_EXTENSIONS = {
 }
 
 
-def _scan_repo(source_path: str) -> tuple:
+def _scan_repo(source_path: str, ignore_globs: Optional[list] = None) -> tuple:
     """Single-pass directory walk returning (size_mb: int, loc: int).
 
     Combining both metrics into one walk halves filesystem I/O versus calling
@@ -663,9 +716,20 @@ def _scan_repo(source_path: str) -> tuple:
     total_lines = 0
     try:
         for dirpath, dirnames, filenames in os.walk(source_path):
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _SKIP_DIRS
+                and not path_matches_globs(
+                    os.path.relpath(os.path.join(dirpath, d), source_path),
+                    ignore_globs or [], is_dir=True,
+                )
+            ]
             for filename in filenames:
                 filepath = os.path.join(dirpath, filename)
+                if path_matches_globs(
+                    os.path.relpath(filepath, source_path), ignore_globs or []
+                ):
+                    continue
                 try:
                     total_size += os.path.getsize(filepath)
                 except OSError as e:
@@ -724,7 +788,9 @@ def _classify_cpg_build_failure(exit_code, output: str, build_heap_gb: int) -> t
     return "BUILD_ERROR", f"CPG generation failed (exit {exit_code}). Frontend tail: {tail}"
 
 
-def _copy_local_source_tree(host_path: str, codebase_dir: str) -> None:
+def _copy_local_source_tree(
+    host_path: str, codebase_dir: str, ignore_globs: Optional[list] = None
+) -> None:
     """Copy a local source tree into the playground snapshot dir, atomically.
 
     Symlink-safe: never dereferences symlinks whose target escapes the source root
@@ -749,11 +815,24 @@ def _copy_local_source_tree(host_path: str, codebase_dir: str) -> None:
     tmp_dir = f"{codebase_dir}.tmp.{uuid.uuid4().hex}"
     os.makedirs(tmp_dir, exist_ok=True)
     real_root = os.path.realpath(host_path)
+
+    def copytree_ignore(directory, names):
+        return {
+            name for name in names
+            if path_matches_globs(
+                os.path.relpath(os.path.join(directory, name), host_path),
+                ignore_globs or [],
+                is_dir=os.path.isdir(os.path.join(directory, name)),
+            )
+        }
+
     try:
         for item in os.listdir(host_path):
             src_item = os.path.join(host_path, item)
             dst_item = os.path.join(tmp_dir, item)
 
+            if path_matches_globs(item, ignore_globs or [], is_dir=os.path.isdir(src_item)):
+                continue
             if os.path.islink(src_item):
                 if not os.path.realpath(src_item).startswith(real_root + os.sep):
                     logger.warning(f"Skipping symlink escaping source root: {item}")
@@ -761,7 +840,10 @@ def _copy_local_source_tree(host_path: str, codebase_dir: str) -> None:
 
             if os.path.isdir(src_item):
                 # symlinks=True: copy nested links as links, never dereference out of tree.
-                shutil.copytree(src_item, dst_item, dirs_exist_ok=True, symlinks=True)
+                shutil.copytree(
+                    src_item, dst_item, dirs_exist_ok=True, symlinks=True,
+                    ignore=copytree_ignore if ignore_globs else None,
+                )
             else:
                 shutil.copy2(src_item, dst_item, follow_symlinks=False)
 
@@ -776,7 +858,42 @@ def _copy_local_source_tree(host_path: str, codebase_dir: str) -> None:
         raise
 
 
-def _copy_local_source_tree_via_daemon(host_path: str, codebase_hash: str) -> None:
+def _prune_ignored_paths(root: str, ignore_globs: Optional[list]) -> None:
+    """Apply ignore_globs to a source already staged by clone/snippet."""
+    if not ignore_globs:
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        for dirname in list(dirnames):
+            path = os.path.join(dirpath, dirname)
+            if path_matches_globs(
+                os.path.relpath(path, root), ignore_globs, is_dir=True
+            ):
+                if os.path.islink(path):
+                    os.unlink(path)
+                else:
+                    shutil.rmtree(path)
+                dirnames.remove(dirname)
+        for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            if path_matches_globs(os.path.relpath(path, root), ignore_globs):
+                os.unlink(path)
+
+
+def _bash_ignore_prelude(ignore_globs: Optional[list]) -> str:
+    regexes = [r for r in (glob_to_path_regex(g) for g in (ignore_globs or [])) if r]
+    if not regexes:
+        return ""
+    union = "|".join(f"({regex})" for regex in regexes)
+    return (
+        f"ignore_rx={shlex.quote(union)}; "
+        'is_ignored() { local p="${1#./}"; '
+        '[[ "$p" =~ ^($ignore_rx)$ ]] || [[ "${p}/" =~ ^($ignore_rx)$ ]]; }; '
+    )
+
+
+def _copy_local_source_tree_via_daemon(
+    host_path: str, codebase_hash: str, ignore_globs: Optional[list] = None
+) -> None:
     """Copy a host source tree into the playground via a short-lived helper container.
 
     Used when the MCP is containerized and `host_path` lives on the host
@@ -818,19 +935,34 @@ def _copy_local_source_tree_via_daemon(host_path: str, codebase_hash: str) -> No
     src = "/src/" + shlex.quote(base)                       # source dir inside helper
     dst = "/pg/codebases/" + shlex.quote(codebase_hash)
     tmp = dst + ".tmp"
-    script = (
-        "set -e; "
-        f"test -d {src}; "
-        f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
-        f"rm -rf {tmp} {dst}; "
-        f"mkdir -p {tmp}; "
-        f"cp -a {src}/. {tmp}/; "
-        f"mv {tmp} {dst}"
-    )
+    if ignore_globs:
+        script = (
+            "set -euo pipefail; "
+            f"test -d {src}; "
+            f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
+            f"rm -rf {tmp} {dst}; mkdir -p {tmp}; cd {src}; "
+            f"{_bash_ignore_prelude(ignore_globs)}"
+            "find . -mindepth 1 -print0 | while IFS= read -r -d '' item; do "
+            'if ! is_ignored "$item"; then printf "%s\\0" "$item"; fi; done '
+            "| tar --null --no-recursion -T - -cf - "
+            f"| tar -xf - -C {tmp}; mv {tmp} {dst}"
+        )
+        shell = "/bin/bash"
+    else:
+        script = (
+            "set -e; "
+            f"test -d {src}; "
+            f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
+            f"rm -rf {tmp} {dst}; "
+            f"mkdir -p {tmp}; "
+            f"cp -a {src}/. {tmp}/; "
+            f"mv {tmp} {dst}"
+        )
+        shell = "/bin/sh"
     try:
         client.containers.run(
             image=image,
-            entrypoint=["/bin/sh", "-c", script],
+            entrypoint=[shell, "-c", script],
             volumes={
                 parent: {"bind": "/src", "mode": "ro"},
                 playground_host: {"bind": "/pg", "mode": "rw"},
@@ -861,7 +993,7 @@ def _joern_helper_image() -> str:
         )
 
 
-def _scan_repo_via_daemon(host_path: str) -> tuple:
+def _scan_repo_via_daemon(host_path: str, ignore_globs: Optional[list] = None) -> tuple:
     """Measure a host-only source tree through a read-only helper container."""
     clean = host_path.rstrip("/")
     parent, base = os.path.dirname(clean), os.path.basename(clean)
@@ -882,20 +1014,37 @@ def _scan_repo_via_daemon(host_path: str) -> tuple:
         "-o -name '*.swift' -o -name '*.rs' -o -name '*.sh' -o -name '*.bash' "
         "-o -name '*.xml' -o -name '*.json' -o -name '*.yaml' -o -name '*.yml' \\)"
     )
-    script = (
-        "set -e; "
-        f"cd {src}; "
-        f"bytes=$(find . -type d {prune_dirs} -prune -o -type f -printf '%s\\n' "
-        "| awk '{sum += $1} END {print sum + 0}'); "
-        f"loc=$(find . -type d {prune_dirs} -prune -o -type f {source_names} -print0 "
-        "| xargs -0 -r -n 1 wc -l | awk '{sum += $1} END {print sum + 0}'); "
-        'printf "%s %s\\n" "$bytes" "$loc"'
-    )
+    if ignore_globs:
+        script = (
+            "set -euo pipefail; "
+            f"cd {src}; {_bash_ignore_prelude(ignore_globs)}"
+            f"bytes=$(find . -type d {prune_dirs} -prune -o -type f -print0 "
+            "| while IFS= read -r -d '' file; do "
+            'if ! is_ignored "$file"; then stat -c "%s" -- "$file"; fi; done '
+            "| awk '{sum += $1} END {print sum + 0}'); "
+            f"loc=$(find . -type d {prune_dirs} -prune -o -type f {source_names} -print0 "
+            "| while IFS= read -r -d '' file; do "
+            'if ! is_ignored "$file"; then printf "%s\\0" "$file"; fi; done '
+            "| xargs -0 -r -n 1 wc -l | awk '{sum += $1} END {print sum + 0}'); "
+            'printf "%s %s\\n" "$bytes" "$loc"'
+        )
+        shell = "/bin/bash"
+    else:
+        script = (
+            "set -e; "
+            f"cd {src}; "
+            f"bytes=$(find . -type d {prune_dirs} -prune -o -type f -printf '%s\\n' "
+            "| awk '{sum += $1} END {print sum + 0}'); "
+            f"loc=$(find . -type d {prune_dirs} -prune -o -type f {source_names} -print0 "
+            "| xargs -0 -r -n 1 wc -l | awk '{sum += $1} END {print sum + 0}'); "
+            'printf "%s %s\\n" "$bytes" "$loc"'
+        )
+        shell = "/bin/sh"
     client = docker.from_env()
     try:
         out = client.containers.run(
             image=_joern_helper_image(),
-            entrypoint=["/bin/sh", "-c", script],
+            entrypoint=[shell, "-c", script],
             volumes={parent: {"bind": "/src", "mode": "ro"}},
             remove=True,
             network_disabled=True,
@@ -916,7 +1065,7 @@ def _scan_repo_via_daemon(host_path: str) -> tuple:
     return int(total_bytes / (1024 * 1024)), total_lines
 
 
-def _hash_tree_in_process(root: str) -> str:
+def _hash_tree_in_process(root: str, ignore_globs: Optional[list] = None) -> str:
     """Deterministic content fingerprint of a directory tree (this process reads it).
 
     Hashes (relative-path, file-content) for every regular file, excluding .git,
@@ -925,11 +1074,19 @@ def _hash_tree_in_process(root: str) -> str:
     """
     entries = []
     for dirpath, dirs, files in os.walk(root):
-        if ".git" in dirs:
-            dirs.remove(".git")
+        dirs[:] = [
+            d for d in dirs
+            if d != ".git"
+            and not path_matches_globs(
+                os.path.relpath(os.path.join(dirpath, d), root),
+                ignore_globs or [], is_dir=True,
+            )
+        ]
         for f in sorted(files):
             fp = os.path.join(dirpath, f)
             rel = os.path.relpath(fp, root)
+            if path_matches_globs(rel, ignore_globs or []):
+                continue
             if os.path.islink(fp):
                 h = hashlib.sha256(b"L" + os.readlink(fp).encode()).hexdigest()
             else:
@@ -943,7 +1100,9 @@ def _hash_tree_in_process(root: str) -> str:
     return hashlib.sha256("\n".join(entries).encode()).hexdigest()
 
 
-def _fingerprint_local_source_via_daemon(host_path: str) -> str:
+def _fingerprint_local_source_via_daemon(
+    host_path: str, ignore_globs: Optional[list] = None
+) -> str:
     """Content fingerprint of a host tree the MCP can't read, via a helper container.
 
     Deterministic within a deployment (always taken from the host daemon): hashes
@@ -958,17 +1117,29 @@ def _fingerprint_local_source_via_daemon(host_path: str) -> str:
 
     src = "/src/" + shlex.quote(base)
     # find (excluding .git) -> stable sort -> per-file sha256 -> sha256 of the lot.
-    script = (
-        "set -e; "
-        f"cd {src}; "
-        "find . -path ./.git -prune -o -type f -print0 "
-        "| LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64"
-    )
+    if ignore_globs:
+        script = (
+            "set -euo pipefail; "
+            f"cd {src}; {_bash_ignore_prelude(ignore_globs)}"
+            "find . -path ./.git -prune -o -type f -print0 "
+            "| while IFS= read -r -d '' file; do "
+            'if ! is_ignored "$file"; then printf "%s\\0" "$file"; fi; done '
+            "| LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64"
+        )
+        shell = "/bin/bash"
+    else:
+        script = (
+            "set -e; "
+            f"cd {src}; "
+            "find . -path ./.git -prune -o -type f -print0 "
+            "| LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64"
+        )
+        shell = "/bin/sh"
     client = docker.from_env()
     try:
         out = client.containers.run(
             image=_joern_helper_image(),
-            entrypoint=["/bin/sh", "-c", script],
+            entrypoint=[shell, "-c", script],
             volumes={parent: {"bind": "/src", "mode": "ro"}},
             remove=True,
             network_disabled=True,
@@ -983,7 +1154,9 @@ def _fingerprint_local_source_via_daemon(host_path: str) -> str:
     return digest
 
 
-def _fingerprint_local_source(source_path: str) -> str:
+def _fingerprint_local_source(
+    source_path: str, ignore_globs: Optional[list] = None
+) -> str:
     """Content fingerprint for a local source, used as the CPG cache key.
 
     Reads the tree in-process when it is visible (MCP on host / bind-mounted),
@@ -993,8 +1166,8 @@ def _fingerprint_local_source(source_path: str) -> str:
     """
     host_path = resolve_host_path(source_path, require_local_access=False)
     if os.path.exists(host_path):
-        return _hash_tree_in_process(host_path)
-    return _fingerprint_local_source_via_daemon(host_path)
+        return _hash_tree_in_process(host_path, ignore_globs)
+    return _fingerprint_local_source_via_daemon(host_path, ignore_globs)
 
 
 def _reclaim_source_snapshot(codebase_dir: str, cpg_path: str, config) -> bool:
@@ -1209,6 +1382,7 @@ async def _generate_cpg_async(
     include_paths: Optional[list] = None,
     defines: Optional[list] = None,
     include_globs: Optional[list] = None,
+    exclude_globs: Optional[list] = None,
     auto_system_headers: bool = False,
     compile_commands: Optional[str] = None,
     source_root_host: Optional[str] = None,
@@ -1279,39 +1453,11 @@ async def _generate_cpg_async(
 
         cmd = [cmd_binary, f"/playground/codebases/{codebase_hash}", "-o", container_cpg_path]
 
-        # Build a single --exclude-regex from: (1) the default junk patterns
-        # (tests/docs/build dirs) and (2) include_globs scoping (drop out-of-scope
-        # SOURCE TUs while keeping headers includable). A file is excluded if it
-        # matches EITHER, so they OR together. --exclude-regex is supported by
-        # every frontend, so scoping works for all languages.
-        exclude_parts = []
-        if config and language in config.cpg.languages_with_exclusions and config.cpg.exclusion_patterns:
-            escaped_patterns = []
-            for pattern in config.cpg.exclusion_patterns:
-                try:
-                    re.compile(pattern)
-                    escaped_patterns.append(pattern)
-                except re.error as e:
-                    logger.warning(f"Invalid regex pattern '{pattern}': {e}. Using literal match.")
-                    escaped_patterns.append(re.escape(pattern))
-            exclude_parts.append("|".join(f"({p})" for p in escaped_patterns))
-            logger.info(f"Applied {len(config.cpg.exclusion_patterns)} exclusion patterns")
-
-        if include_globs and frontend_supports(language, "exclude_regex"):
-            src_exts = SCOPE_SOURCE_EXTENSIONS.get(
-                language, [LANGUAGE_EXTENSIONS.get(language, language)]
-            )
-            scope_rx = scope_exclude_regex(list(include_globs), src_exts)
-            if scope_rx:
-                exclude_parts.append(scope_rx)
-                logger.info(
-                    f"Scoping build to {len(include_globs)} include_glob(s); "
-                    f"out-of-scope {language} sources will be skipped (headers kept)"
-                )
-            else:
-                logger.warning(f"include_globs={include_globs!r} produced no usable scope filter; ignoring")
-
-        combined_exclude = combine_exclude_regexes(exclude_parts)
+        # Omitted exclusions inherit legacy defaults; [] disables them; a
+        # nonempty list replaces them. include_globs selects TUs and exclusions win.
+        combined_exclude = _build_frontend_exclude_regex(
+            language, config, include_globs, exclude_globs
+        )
         if combined_exclude:
             cmd.extend(["--exclude-regex", combined_exclude])
 
@@ -1900,8 +2046,10 @@ Examples:
         include_paths: Annotated[Optional[list], Field(description="C/C++ only: extra header include directories for c2cpg (--include). Relative paths resolve against the source root (e.g. 'include', '_build/include'); absolute paths pass through. Use when a project's generated headers (e.g. a configure/cmake-produced xmlversion.h or config.h) gate code behind feature macros — the source root, any include/ dir, and dirs containing config.h/*version*.h are auto-detected, so this is only needed for non-standard layouts.")] = None,
         defines: Annotated[Optional[list], Field(description="C/C++ only: preprocessor macros to define for c2cpg (--define), e.g. ['LIBXML_CATALOG_ENABLED', 'FOO=1']. Use to force-enable #ifdef-gated modules when the defining header can't be found.")] = None,
         include_globs: Annotated[Optional[list], Field(description="Scope a LARGE repo to a subset of it WITHOUT losing cross-directory header/macro resolution (all languages). Path globs relative to the repo root, e.g. ['libavcodec/**','libavutil/**'] or ['epan/dissectors/']. The repo root stays the parse base; only source translation units OUTSIDE these globs are skipped (headers stay includable). Prefer this over pointing source_path at a subdirectory, which silently drops cross-dir edges. Supports ** (any dirs), * (one path segment), ? (one char); a bare name or trailing-slob is a directory prefix. Caveat: a call into a function defined in an out-of-scope file resolves the name but not its body — scope widely enough to cover your call targets.")] = None,
+        exclude_globs: Annotated[Optional[list], Field(description="Repo-relative POSIX globs subtracted from selected translation units. Omit to inherit legacy defaults; [] disables them; a nonempty list replaces them. Exclusion wins. Headers/support files remain available.")] = None,
+        ignore_globs: Annotated[Optional[list], Field(description="Repo-relative POSIX globs removed before scan, fingerprint, snapshot copy, compile-database/include discovery, and frontend input.")] = None,
         auto_system_headers: Annotated[bool, Field(description="C/C++ only: enable c2cpg --with-include-auto-discovery so system header paths (libc/STL, e.g. <stdio.h>, <string>) are auto-found. Turn ON when coverage looks poor — unresolved standard headers cause parse errors that silently drop whole files / #ifdef-gated bodies. Off by default because it slows builds and isn't needed when a project only uses its own headers. For EXACT per-file compiler flags/defines, prefer compile_commands instead.")] = False,
-        compile_commands: Annotated[Optional[str], Field(description="C/C++ only, HIGHEST fidelity: path (relative to the source root, e.g. 'build/compile_commands.json') to a compilation database. Gives c2cpg the EXACT per-file -I/-D/-std flags, so headers and #ifdef-gated code resolve as in the real build — the best fix for gated-code coverage. Generate it with CMAKE_EXPORT_COMPILE_COMMANDS=ON or `bear -- make`, committed/copied inside the source. Absolute build-machine paths in the DB are auto-rebased onto the analyzed copy (works best for local sources). If it can't be applied, the build proceeds without it and logs why.")] = None,
+        compile_commands: Annotated[Optional[str], Field(description="C/C++ only: repository-relative POSIX path to a compilation database inside the source root (e.g. 'build/compile_commands.json'). Per-file absolute paths inside it are rebased. External databases are unsupported.")] = None,
     ) -> Dict[str, Any]:
         """Create a Code Property Graph from source code for analysis.
 
@@ -1967,6 +2115,23 @@ Examples:
             codebase_tracker = services["codebase_tracker"]
             config = services.get("config")
 
+            # Normalize before any source observation so scan, fingerprint, copy,
+            # execution, and cache identity use the same policy.
+            include_paths = _sanitize_build_opt_list(include_paths, "include path")
+            defines = _sanitize_build_opt_list(defines, "define")
+            include_globs = normalize_path_globs(include_globs, "include_globs") or []
+            exclude_globs = normalize_path_globs(exclude_globs, "exclude_globs")
+            ignore_globs = normalize_path_globs(ignore_globs, "ignore_globs") or []
+            compile_commands = _normalize_compile_commands_path(compile_commands)
+            if compile_commands and path_matches_globs(compile_commands, ignore_globs):
+                raise ValidationError(
+                    "compile_commands is excluded by ignore_globs; keep it in the "
+                    "analysis source view or omit the explicit path"
+                )
+            if (include_paths or defines) and language not in ("c", "cpp"):
+                logger.warning(f"include_paths/defines ignored for language '{language}' (C/C++ only)")
+                include_paths, defines = [], []
+
             # Large-project guard: warn before committing to an expensive full-project CPG.
             # Thresholds are configurable and the whole guard can be turned off
             # (CPG_LARGE_PROJECT_GUARD=false) for unattended/batch drivers that always
@@ -1981,10 +2146,10 @@ Examples:
                     resolve_host_path, source_path, False
                 )
                 if os.path.exists(resolved):
-                    size_mb, loc = await asyncio.to_thread(_scan_repo, resolved)
+                    size_mb, loc = await asyncio.to_thread(_scan_repo, resolved, ignore_globs)
                 else:
                     size_mb, loc = await asyncio.to_thread(
-                        _scan_repo_via_daemon, resolved
+                        _scan_repo_via_daemon, resolved, ignore_globs
                     )
                 if size_mb > max_mb or loc > max_loc:
                     return {
@@ -2010,7 +2175,9 @@ Examples:
                 try:
                     # Content fingerprint of the tree (works for non-git sources and
                     # for a containerized MCP that can't read the host path directly).
-                    content_fp = await asyncio.to_thread(_fingerprint_local_source, source_path)
+                    content_fp = await asyncio.to_thread(
+                        _fingerprint_local_source, source_path, ignore_globs
+                    )
                     if not content_fp:
                         raise ValidationError("Fingerprint helper returned no digest")
                     logger.info(f"Local source content fingerprint: {content_fp[:16]}")
@@ -2024,26 +2191,14 @@ Examples:
                         "because safe cache reuse could not be verified"
                     ) from e
 
-            # Normalize every caller-controlled graph-shaping list before both keying
-            # and execution so the cache identity matches the effective build.
-            include_paths = _sanitize_build_opt_list(include_paths, "include path")
-            defines = _sanitize_build_opt_list(defines, "define")
-            include_globs = _sanitize_build_opt_list(include_globs, "include glob")
-            _compile_commands = _sanitize_build_opt_list(
-                [compile_commands] if compile_commands else [],
-                "compile_commands path",
-            )
-            compile_commands = _compile_commands[0] if _compile_commands else None
-            if (include_paths or defines) and language not in ("c", "cpp"):
-                logger.warning(f"include_paths/defines ignored for language '{language}' (C/C++ only)")
-                include_paths, defines = [], []
-
             build_spec = _get_cpg_build_spec(
                 language=language,
                 config=config,
                 include_paths=include_paths,
                 defines=defines,
                 include_globs=include_globs,
+                exclude_globs=exclude_globs,
+                ignore_globs=ignore_globs,
                 auto_system_headers=auto_system_headers,
                 compile_commands=compile_commands,
             )
@@ -2276,7 +2431,7 @@ Examples:
                                 # Path is visible to this process (MCP on host, or the
                                 # source is bind-mounted in): copy in-process.
                                 await asyncio.to_thread(
-                                    _copy_local_source_tree, host_path, codebase_dir
+                                    _copy_local_source_tree, host_path, codebase_dir, ignore_globs
                                 )
                             else:
                                 # Containerized MCP + host-only path: copy via the host
@@ -2285,7 +2440,8 @@ Examples:
                                     f"{host_path} not visible to MCP; copying via host-daemon helper"
                                 )
                                 await asyncio.to_thread(
-                                    _copy_local_source_tree_via_daemon, host_path, codebase_hash
+                                    _copy_local_source_tree_via_daemon,
+                                    host_path, codebase_hash, ignore_globs,
                                 )
                             logger.info(f"Source copied successfully to {codebase_dir}")
                         except OSError as e:
@@ -2293,6 +2449,9 @@ Examples:
                             raise ValidationError("Failed to copy local source directory")
                     else:
                         logger.info(f"Using existing source at {codebase_dir}")
+
+                if source_type in ("github", "snippet") and ignore_globs:
+                    await asyncio.to_thread(_prune_ignored_paths, codebase_dir, ignore_globs)
 
                 cpg_dir = os.path.join(playground_path, "cpgs", codebase_hash)
                 cpg_path = os.path.join(cpg_dir, "cpg.bin")
@@ -2339,6 +2498,7 @@ Examples:
                     include_paths=include_paths or None,
                     defines=defines or None,
                     include_globs=include_globs or None,
+                    exclude_globs=exclude_globs,
                     auto_system_headers=bool(auto_system_headers),
                     compile_commands=compile_commands or None,
                     source_root_host=source_root_host,

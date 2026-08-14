@@ -5,7 +5,7 @@ independent (so identical trees dedupe), file-order independent, and .git is exc
 
 import os
 
-from src.tools.core_tools import _hash_tree_in_process
+from src.tools.core_tools import _copy_local_source_tree, _hash_tree_in_process
 
 
 def _write(path, data=""):
@@ -57,3 +57,19 @@ def test_returns_hex_digest(tmp_path):
     h = _hash_tree_in_process(str(tmp_path))
     assert isinstance(h, str) and len(h) == 64
     int(h, 16)
+
+
+def test_ignored_content_is_absent_from_fingerprint_and_snapshot(tmp_path):
+    source, snapshot = tmp_path / "source", tmp_path / "snapshot"
+    _write(str(source / "src" / "main.c"), "int main(void) { return 0; }")
+    ignored = source / ".work" / "cache.bin"
+    _write(str(ignored), "first")
+
+    ignore_globs = [".work/**"]
+    before = _hash_tree_in_process(str(source), ignore_globs)
+    _copy_local_source_tree(str(source), str(snapshot), ignore_globs)
+    _write(str(ignored), "second")
+
+    assert _hash_tree_in_process(str(source), ignore_globs) == before
+    assert (snapshot / "src" / "main.c").exists()
+    assert not (snapshot / ".work").exists()

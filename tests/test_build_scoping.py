@@ -1,13 +1,17 @@
 """Unit tests for include_globs → exclude-regex scoping construction."""
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
+from src.tools.core_tools import _build_frontend_exclude_regex
 from src.utils.build_scoping import (
     glob_to_path_regex,
     scope_exclude_regex,
     combine_exclude_regexes,
+    normalize_path_globs,
+    path_matches_globs,
 )
 
 
@@ -108,3 +112,45 @@ class TestCombineExcludeRegexes:
 
     def test_single_passthrough(self):
         assert combine_exclude_regexes([None, "x.*"]) == "x.*"
+
+
+def _legacy_config():
+    return SimpleNamespace(cpg=SimpleNamespace(
+        languages_with_exclusions=["go", "cpp"],
+        exclusion_patterns=[r"(?:^|.*/)tool.*/.*"],
+    ))
+
+
+class TestSourceSelectionPolicy:
+    def test_omitted_exclusions_preserve_legacy_defaults(self):
+        rx = _build_frontend_exclude_regex("go", _legacy_config(), exclude_globs=None)
+        assert _excluded(rx, "tools/dispatcher/main.go")
+
+    def test_explicit_empty_exclusions_disable_legacy_defaults(self):
+        rx = _build_frontend_exclude_regex("go", _legacy_config(), exclude_globs=[])
+        assert rx is None
+
+    def test_explicit_exclusions_replace_defaults_and_win_over_inclusion(self):
+        rx = _build_frontend_exclude_regex(
+            "cpp", _legacy_config(),
+            include_globs=["tools/**", "external/**"],
+            exclude_globs=["external/generated/**"],
+        )
+        assert not _excluded(rx, "tools/dispatcher/main.cpp")
+        assert not _excluded(rx, "external/owned.cpp")
+        assert _excluded(rx, "external/generated/code.cpp")
+
+    def test_explicit_exclusions_retain_headers(self):
+        rx = _build_frontend_exclude_regex(
+            "cpp", _legacy_config(), exclude_globs=["external/**"]
+        )
+        assert _excluded(rx, "external/owned.cpp")
+        assert not _excluded(rx, "external/owned.hpp")
+
+    def test_glob_normalization_preserves_leading_dot(self):
+        globs = normalize_path_globs(
+            [" .work/** ", "./src/**", ".work/**"], "ignore_globs"
+        )
+        assert globs == [".work/**", "src/**"]
+        assert path_matches_globs(".work/cache/data.bin", globs)
+        assert not path_matches_globs("work/cache/data.bin", globs)

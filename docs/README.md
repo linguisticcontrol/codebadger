@@ -24,6 +24,7 @@ These docs are for two audiences:
 | [Available Tools](available-tools.md) | Every MCP tool by category, with a description of what each does. |
 | [Configuration](configuration.md) | `config.yaml` + environment variable reference, telemetry. |
 | [Deployment](deployment.md) | Docker Compose, Postgres/Redis profiles, memory sizing, `shared` vs `pool` mode, large batches. |
+| [Windows + WSL2](windows-wsl2.md) | Native WSL Docker Engine and Windows-agent MCP setup. |
 | [Architecture](architecture.md) | System design, request flow, memory-aware admission, and design decisions (with diagrams). |
 | [Security](security.md) | Threat model, trust boundaries, the controls we provide, and production hardening. |
 | [Custom Tools](custom-tools.md) | Add your own detectors without touching the core. |

@@ -34,6 +34,7 @@ Everything a developer or security researcher needs lives in **[docs/](docs/)**:
 | [Available Tools](docs/available-tools.md) | Every MCP tool by category, with a description of what each does. |
 | [Configuration](docs/configuration.md) | `config.yaml` / env reference, telemetry. |
 | [Deployment](docs/deployment.md) | Postgres/Redis, memory sizing, `shared` vs `pool`, large batches. |
+| [Windows + WSL2](docs/windows-wsl2.md) | Native WSL Docker Engine and Windows-agent MCP setup. |
 | [Architecture](docs/architecture.md) | System design and diagrams. |
 | [Security](docs/security.md) | Threat model, trust boundaries, and production hardening. |
 | [Custom Tools](docs/custom-tools.md) | Add your own detectors. |

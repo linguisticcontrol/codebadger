@@ -1,0 +1,27 @@
+[mcp_servers.codebadger]
+command = "pwsh.exe"
+args = [
+  "-NoLogo",
+  "-NoProfile",
+  "-NonInteractive",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-Command",
+  "$root = (& git rev-parse --show-toplevel); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & (Join-Path $root 'scripts/start_codebadger_mcp.ps1')",
+]
+enabled = true
+required = false
+startup_timeout_sec = 300
+tool_timeout_sec = 600
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.codebadger.env]
+CODEBADGER_WSL_DISTRO = "Ubuntu"
+CODEBADGER_WSL_PROJECT_DIR = "/home/otto/codebadger"
+CODEBADGER_COMPOSE_PROJECT = "codebadger"
+CODEBADGER_HEALTH_URL = "http://127.0.0.1:4242/health"
+CODEBADGER_DOCKER_NETWORK = "codebadger"
+CODEBADGER_PROXY_IMAGE = "codebadger-mcp:latest"
+CODEBADGER_UPSTREAM_URL = "http://codebadger-mcp:4242/mcp"
+CODEBADGER_TOOL_PROFILE = "controller"
+CODEBADGER_BOOT_TIMEOUT_SEC = "180"

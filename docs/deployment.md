@@ -32,6 +32,7 @@ git clone http://github.com/lekssays/codebadger && cd codebadger
 
 # 2. Configure for your host: copy the template and edit
 cp .env.example .env
+cp config.example.yaml config.yaml
 #   Set at minimum:
 #     PLAYGROUND_HOST_PATH=/abs/path/to/codebadger/playground   # ABSOLUTE
 #     MCP_HOST=0.0.0.0                                           # or 127.0.0.1 behind a proxy

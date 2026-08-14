@@ -145,3 +145,5 @@ codebadger.db
 docker-compose.override.yml
 scripts/backfill_overlays.sh
 .claude/settings.json
+# Disposable client-side pointer to the currently active checkpoint CPG(s).
+.codebadger/active-cpgs.json

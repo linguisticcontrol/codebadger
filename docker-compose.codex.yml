@@ -1,0 +1,10 @@
+# On-demand Codex deployment override.
+#
+# The MCP service is configured for JOERN_WORKER_MODE=pool and reaches each
+# query worker by container name over the "codebadger" network. The base
+# service's 500-port host publication is only useful for direct host debugging
+# of legacy/shared Joern processes; restoring those rules dominates WSL cold
+# startup. Keep the base file unchanged and remove only that publication here.
+services:
+  codebadger-joern-server:
+    ports: !reset []

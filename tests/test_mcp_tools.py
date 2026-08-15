@@ -764,6 +764,10 @@ class TestMCPTools:
         # out-of-scope python source excluded; in-scope kept; headers concept n/a
         assert re.match(rx + r"\Z", "other/mod.py")
         assert not re.match(rx + r"\Z", "pkg/mod.py")
+        root = "/playground/codebases/553642871dd4251d"
+        assert re.match(rx + r"\Z", f"{root}/other/mod.py")
+        assert not re.match(rx + r"\Z", f"{root}/pkg/mod.py")
+        assert re.match(rx + r"\Z", "/other/root/pkg/mod.py")
 
     @pytest.mark.asyncio
     async def test_compile_commands_passed_and_rebased_for_c(self, mock_services, tmp_path):

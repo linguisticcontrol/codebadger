@@ -6,9 +6,9 @@ the parse base and use the universally-supported `--exclude-regex` to drop the
 SOURCE translation units that fall outside the requested globs — while leaving
 headers (and in-scope sources) fully resolvable.
 
-The frontend matches `--exclude-regex` against each file's path RELATIVE to the
-input dir using full-match (Java `String.matches`) semantics, so every pattern
-here is written to match the whole relative path.
+Frontends may match `--exclude-regex` against either a repository-relative path
+or the absolute path below their input directory. Generated patterns therefore
+accept only those two exact forms and use full-match semantics.
 
 Tradeoff (documented for callers): a call from an in-scope file into a function
 defined in an out-of-scope file still resolves the *name*, but that callee's
@@ -107,7 +107,22 @@ def path_matches_globs(path: str, globs: List[str], *, is_dir: bool = False) -> 
     )
 
 
-def scope_exclude_regex(include_globs: List[str], source_exts: List[str]) -> Optional[str]:
+def _frontend_path_forms(
+    path_regexes: List[str], frontend_input_root: Optional[str]
+) -> str:
+    """Match repo-relative paths and paths below one exact frontend input root."""
+    relative = "|".join(f"(?:{regex})" for regex in path_regexes)
+    root = str(frontend_input_root or "").rstrip("/")
+    if not root:
+        return relative
+    return f"(?:{relative}|{re.escape(root)}/(?:{relative}))"
+
+
+def scope_exclude_regex(
+    include_globs: List[str],
+    source_exts: List[str],
+    frontend_input_root: Optional[str] = None,
+) -> Optional[str]:
     """Build an `--exclude-regex` that drops out-of-scope SOURCE files.
 
     A path is excluded iff it (a) ends in one of `source_exts` AND (b) does not
@@ -123,20 +138,24 @@ def scope_exclude_regex(include_globs: List[str], source_exts: List[str]) -> Opt
     if not exts:
         return None
     ext_alt = "|".join(exts)
-    keep_alt = "|".join(f"(?:{k})" for k in keeps)
+    keep_forms = _frontend_path_forms(keeps, frontend_input_root)
     # Full-match (.matches) anchored: must be a source file (positive lookahead)
     # AND not in scope (negative lookahead), then consume the whole path.
-    return f"(?=.*\\.(?:{ext_alt})$)(?!(?:{keep_alt})$).*"
+    return f"^(?=.*\\.(?:{ext_alt})$)(?!(?:{keep_forms})$).*$"
 
 
-def exclude_globs_regex(exclude_globs: List[str], source_exts: List[str]) -> Optional[str]:
+def exclude_globs_regex(
+    exclude_globs: List[str],
+    source_exts: List[str],
+    frontend_input_root: Optional[str] = None,
+) -> Optional[str]:
     """Exclude matching source translation units while retaining support files."""
     drops = [r for r in (glob_to_path_regex(g) for g in exclude_globs) if r]
     exts = [re.escape(e.lstrip(".")) for e in source_exts if e and e.strip()]
     if not drops or not exts:
         return None
-    drop_alt = "|".join(f"(?:{r})" for r in drops)
-    return f"(?=.*\\.(?:{'|'.join(exts)})$)(?:{drop_alt})"
+    drop_forms = _frontend_path_forms(drops, frontend_input_root)
+    return f"^(?=.*\\.(?:{'|'.join(exts)})$)(?:{drop_forms})$"
 
 
 def combine_exclude_regexes(parts: List[Optional[str]]) -> Optional[str]:

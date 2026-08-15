@@ -58,9 +58,9 @@ REDACTED_CONTAINER_PATH = "<redacted:container-path>"
 REDACTED_LOCAL_SOURCE = "<redacted:local-source>"
 
 # Cache schema epoch. Bump this only when the inputs or semantics used to build a
-# CPG change. The v3 namespace prevents older cache entries (whose
-# keys omitted several graph-shaping inputs) from being reused.
-CPG_CACHE_FORMAT_VERSION = "cpg-cache-v3"
+# CPG change. The epoch prevents older cache entries built under different
+# graph-shaping semantics from being reused.
+CPG_CACHE_FORMAT_VERSION = "cpg-cache-v4"
 
 
 def _public_source_path(source_type: str, source_path: Optional[str]) -> Optional[str]:
@@ -594,6 +594,7 @@ def _build_frontend_exclude_regex(
     config=None,
     include_globs: Optional[list] = None,
     exclude_globs: Optional[list] = None,
+    frontend_input_root: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve inherited or explicit translation-unit selection."""
     if not frontend_supports(language, "exclude_regex"):
@@ -614,9 +615,15 @@ def _build_frontend_exclude_regex(
                     patterns.append(re.escape(pattern))
             parts.append("|".join(f"({pattern})" for pattern in patterns))
     elif exclude_globs:
-        parts.append(exclude_globs_regex(list(exclude_globs), source_exts))
+        parts.append(
+            exclude_globs_regex(
+                list(exclude_globs), source_exts, frontend_input_root
+            )
+        )
     if include_globs:
-        parts.append(scope_exclude_regex(list(include_globs), source_exts))
+        parts.append(
+            scope_exclude_regex(list(include_globs), source_exts, frontend_input_root)
+        )
     return combine_exclude_regexes(parts)
 
 
@@ -819,7 +826,8 @@ def _copy_local_source_tree(
     def copytree_ignore(directory, names):
         return {
             name for name in names
-            if path_matches_globs(
+            if name == ".git"
+            or path_matches_globs(
                 os.path.relpath(os.path.join(directory, name), host_path),
                 ignore_globs or [],
                 is_dir=os.path.isdir(os.path.join(directory, name)),
@@ -831,7 +839,9 @@ def _copy_local_source_tree(
             src_item = os.path.join(host_path, item)
             dst_item = os.path.join(tmp_dir, item)
 
-            if path_matches_globs(item, ignore_globs or [], is_dir=os.path.isdir(src_item)):
+            if item == ".git" or path_matches_globs(
+                item, ignore_globs or [], is_dir=os.path.isdir(src_item)
+            ):
                 continue
             if os.path.islink(src_item):
                 if not os.path.realpath(src_item).startswith(real_root + os.sep):
@@ -842,7 +852,7 @@ def _copy_local_source_tree(
                 # symlinks=True: copy nested links as links, never dereference out of tree.
                 shutil.copytree(
                     src_item, dst_item, dirs_exist_ok=True, symlinks=True,
-                    ignore=copytree_ignore if ignore_globs else None,
+                    ignore=copytree_ignore,
                 )
             else:
                 shutil.copy2(src_item, dst_item, follow_symlinks=False)
@@ -935,30 +945,23 @@ def _copy_local_source_tree_via_daemon(
     src = "/src/" + shlex.quote(base)                       # source dir inside helper
     dst = "/pg/codebases/" + shlex.quote(codebase_hash)
     tmp = dst + ".tmp"
+    filtered_paths = "find . -mindepth 1 -name .git -prune -o -print0 "
     if ignore_globs:
-        script = (
-            "set -euo pipefail; "
-            f"test -d {src}; "
-            f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
-            f"rm -rf {tmp} {dst}; mkdir -p {tmp}; cd {src}; "
-            f"{_bash_ignore_prelude(ignore_globs)}"
-            "find . -mindepth 1 -print0 | while IFS= read -r -d '' item; do "
+        filtered_paths += (
+            "| while IFS= read -r -d '' item; do "
             'if ! is_ignored "$item"; then printf "%s\\0" "$item"; fi; done '
-            "| tar --null --no-recursion -T - -cf - "
-            f"| tar -xf - -C {tmp}; mv {tmp} {dst}"
         )
-        shell = "/bin/bash"
-    else:
-        script = (
-            "set -e; "
-            f"test -d {src}; "
-            f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
-            f"rm -rf {tmp} {dst}; "
-            f"mkdir -p {tmp}; "
-            f"cp -a {src}/. {tmp}/; "
-            f"mv {tmp} {dst}"
-        )
-        shell = "/bin/sh"
+    script = (
+        "set -euo pipefail; "
+        f"test -d {src}; "
+        f'[ -n "$(ls -A {src})" ] || {{ echo "source is empty" >&2; exit 3; }}; '
+        f"rm -rf {tmp} {dst}; mkdir -p {tmp}; cd {src}; "
+        f"{_bash_ignore_prelude(ignore_globs)}"
+        f"{filtered_paths}"
+        "| tar --null --no-recursion -T - -cf - "
+        f"| tar -xf - -C {tmp}; mv {tmp} {dst}"
+    )
+    shell = "/bin/bash"
     try:
         client.containers.run(
             image=image,
@@ -1083,6 +1086,8 @@ def _hash_tree_in_process(root: str, ignore_globs: Optional[list] = None) -> str
             )
         ]
         for f in sorted(files):
+            if f == ".git":
+                continue
             fp = os.path.join(dirpath, f)
             rel = os.path.relpath(fp, root)
             if path_matches_globs(rel, ignore_globs or []):
@@ -1121,7 +1126,7 @@ def _fingerprint_local_source_via_daemon(
         script = (
             "set -euo pipefail; "
             f"cd {src}; {_bash_ignore_prelude(ignore_globs)}"
-            "find . -path ./.git -prune -o -type f -print0 "
+            "find . -name .git -prune -o -type f -print0 "
             "| while IFS= read -r -d '' file; do "
             'if ! is_ignored "$file"; then printf "%s\\0" "$file"; fi; done '
             "| LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64"
@@ -1131,7 +1136,7 @@ def _fingerprint_local_source_via_daemon(
         script = (
             "set -e; "
             f"cd {src}; "
-            "find . -path ./.git -prune -o -type f -print0 "
+            "find . -name .git -prune -o -type f -print0 "
             "| LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64"
         )
         shell = "/bin/sh"
@@ -1451,12 +1456,17 @@ async def _generate_cpg_async(
         if not cmd_binary:
             raise ValueError(f"Unsupported language: {language}")
 
-        cmd = [cmd_binary, f"/playground/codebases/{codebase_hash}", "-o", container_cpg_path]
+        frontend_input_root = f"/playground/codebases/{codebase_hash}"
+        cmd = [cmd_binary, frontend_input_root, "-o", container_cpg_path]
 
         # Omitted exclusions inherit legacy defaults; [] disables them; a
         # nonempty list replaces them. include_globs selects TUs and exclusions win.
         combined_exclude = _build_frontend_exclude_regex(
-            language, config, include_globs, exclude_globs
+            language,
+            config,
+            include_globs,
+            exclude_globs,
+            frontend_input_root,
         )
         if combined_exclude:
             cmd.extend(["--exclude-regex", combined_exclude])

@@ -122,6 +122,31 @@ def _legacy_config():
 
 
 class TestSourceSelectionPolicy:
+    def test_scoped_paths_accept_only_relative_or_exact_frontend_root(self):
+        root = "/playground/codebases/553642871dd4251d"
+        rx = _build_frontend_exclude_regex(
+            "go",
+            _legacy_config(),
+            include_globs=["internal/**", "tools/**"],
+            exclude_globs=["tools/generated/**"],
+            frontend_input_root=root,
+        )
+
+        for relative in ("internal/service.go", "tools/dispatcher/main.go"):
+            assert not _excluded(rx, relative)
+            assert not _excluded(rx, f"{root}/{relative}")
+
+        for relative in (
+            "main.go",
+            "pkg/other.go",
+            "pkg/internal/lookalike.go",
+            "tools/generated/bindings.go",
+        ):
+            assert _excluded(rx, relative)
+            assert _excluded(rx, f"{root}/{relative}")
+
+        assert _excluded(rx, "/other/root/internal/service.go")
+
     def test_omitted_exclusions_preserve_legacy_defaults(self):
         rx = _build_frontend_exclude_regex("go", _legacy_config(), exclude_globs=None)
         assert _excluded(rx, "tools/dispatcher/main.go")

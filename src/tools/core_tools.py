@@ -1994,15 +1994,12 @@ Pasting code directly (source_type='snippet'):
     SAME language (one CPG is single-language).
 
 IMPORTANT — large project guard:
-Before calling this tool for a local path, check the project size. If the project has more than
-15,000 lines of code OR is larger than 150 MB, you MUST warn the user first:
-  "This project is large (X lines / Y MB). CPG generation may take a long time and consume
-   significant resources. Consider providing the absolute path to a specific sub-component
-   (e.g. /path/to/repo/src/module) to scope the analysis. If you still want to analyze the
-   full project, I will proceed."
-Only call generate_cpg after the user either provides a scoped path or explicitly confirms
-they want the full project. Pass force=True when the user confirms the full project.
-This guard does NOT apply to GitHub URLs — size is unknown until cloned.
+Call generate_cpg normally with force=False. For local paths, the server evaluates
+the source against its configured size thresholds. If it returns
+status="large_project_warning", show the returned size and message to the user. Retry
+the same request with force=True only after the user confirms the full analysis.
+Do not pre-scan the source or reproduce the server's thresholds in client logic.
+The guard does not apply to GitHub URLs because their size is unknown until cloned.
 
 Args:
     source_type: One of 'local', 'github' (a github.com/gitlab.com repo), or 'snippet'.
@@ -2015,15 +2012,17 @@ Args:
     code: For snippets, the code wrapped in <code language="..."> ... </code> tag(s).
     github_token: Optional PAT for private repos (never embed it in the URL).
     branch: Optional specific git branch.
-    force: Set to True to skip the large-project size warning (use when the user has
-           explicitly confirmed they want to analyze the full project).
+    force: Leave False on the initial request. Set True only to retry after the server
+           returned status="large_project_warning" and the user confirmed the analysis.
 
 Returns:
     {
         "codebase_hash": "hash of the codebase",
-        "status": "ready" | "generating" | "cached",
+        "status": "ready" | "generating" | "cached" | "large_project_warning",
         "message": "Status message",
-        "cpg_path": "path to CPG file"
+        "cpg_path": "path to CPG file",
+        "size_mb": "returned for large_project_warning",
+        "lines_of_code": "returned for large_project_warning"
     }
 
 Notes:
@@ -2052,7 +2051,7 @@ Examples:
         filename: Annotated[Optional[str], Field(description="Optional filename for a snippet (e.g. 'parser.c'); defaults to snippet.<ext> from the language. Ignored for local/github.")] = None,
         github_token: Annotated[Optional[str], Field(description="GitHub Personal Access Token for private repositories (optional)")] = None,
         branch: Annotated[Optional[str], Field(description="Specific git branch to checkout (optional, defaults to default branch)")] = None,
-        force: Annotated[bool, Field(description="Skip the large-project size warning. Set to True only after the user has explicitly confirmed they want to analyze the full project.")] = False,
+        force: Annotated[bool, Field(description="Retry override for a prior large_project_warning response. Leave False on the initial request; set True only after the user confirms the analysis.")] = False,
         include_paths: Annotated[Optional[list], Field(description="C/C++ only: extra header include directories for c2cpg (--include). Relative paths resolve against the source root (e.g. 'include', '_build/include'); absolute paths pass through. Use when a project's generated headers (e.g. a configure/cmake-produced xmlversion.h or config.h) gate code behind feature macros — the source root, any include/ dir, and dirs containing config.h/*version*.h are auto-detected, so this is only needed for non-standard layouts.")] = None,
         defines: Annotated[Optional[list], Field(description="C/C++ only: preprocessor macros to define for c2cpg (--define), e.g. ['LIBXML_CATALOG_ENABLED', 'FOO=1']. Use to force-enable #ifdef-gated modules when the defining header can't be found.")] = None,
         include_globs: Annotated[Optional[list], Field(description="Scope a LARGE repo to a subset of it WITHOUT losing cross-directory header/macro resolution (all languages). Path globs relative to the repo root, e.g. ['libavcodec/**','libavutil/**'] or ['epan/dissectors/']. The repo root stays the parse base; only source translation units OUTSIDE these globs are skipped (headers stay includable). Prefer this over pointing source_path at a subdirectory, which silently drops cross-dir edges. Supports ** (any dirs), * (one path segment), ? (one char); a bare name or trailing-slob is a directory prefix. Caveat: a call into a function defined in an out-of-scope file resolves the name but not its body — scope widely enough to cover your call targets.")] = None,

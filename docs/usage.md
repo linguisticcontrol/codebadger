@@ -75,9 +75,11 @@ run_cpgql_query(codebase_hash="ddf44eb0a10a85e6",
                 query="cpg.call.name(\"memcpy\").l")
 ```
 
-> Large repos (v8, full wireshark): pass a **sub-component path** instead of the
-> repo root. `generate_cpg` warns past ~15k LOC / 150 MB and needs `force=True`
-> for the full tree. See [Deployment → Large repositories](deployment.md#large-repositories).
+> Call `generate_cpg` normally for local repositories. If the source exceeds the
+> server's configured guard, it returns `large_project_warning` with the measured
+> size instead of starting a build. Narrow the source with `include_globs`, or,
+> after confirming the full analysis, retry with `force=True`. See
+> [Deployment → Large repositories](deployment.md#large-repositories).
 
 ## Tool catalog
 

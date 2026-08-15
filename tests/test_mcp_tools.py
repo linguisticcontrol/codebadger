@@ -1307,36 +1307,60 @@ class TestCopyLocalSourceTree:
 
 
 class TestLargeProjectGuard:
-    """generate_cpg large-project guard: configurable + toggleable (fix #2)."""
+    """The server response, not duplicated client thresholds, controls confirmation."""
 
     @pytest.mark.asyncio
-    async def test_warns_when_guard_on_and_over_threshold(self, mock_services, tmp_path):
+    async def test_tool_metadata_defers_confirmation_until_server_warning(self, mock_services):
         from src.tools.core_tools import register_core_tools
-        mock_services["codebase_tracker"].get_codebase.return_value = None
-        src = tmp_path / "src"; src.mkdir()
-        # default config: guard on, thresholds 2000 MB / 2M LOC -> 3M LOC trips it
-        with patch("src.tools.core_tools.resolve_host_path", return_value=str(src)), \
-             patch("src.tools.core_tools._scan_repo", return_value=(3000, 3_000_000)):
-            mcp = FastMCP("t"); register_core_tools(mcp, mock_services)
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "generate_cpg",
-                    {"source_type": "local", "source_path": str(src), "language": "c"},
-                )
-            import json; d = json.loads(result.content[0].text)
-            assert d["status"] == "large_project_warning"
-            assert d["lines_of_code"] == 3_000_000
+        mcp = FastMCP("t"); register_core_tools(mcp, mock_services)
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+        generate = next(tool for tool in tools if tool.name == "generate_cpg")
+        description = generate.description or ""
+        assert "15,000" not in description
+        assert "150 MB" not in description
+        assert "Call generate_cpg normally with force=False" in description
+        assert 'status="large_project_warning"' in description
+        force_description = generate.inputSchema["properties"]["force"]["description"]
+        assert "prior large_project_warning response" in force_description
 
+    @pytest.mark.parametrize(
+        (
+            "guard_on",
+            "force",
+            "scan_result",
+            "expected_status",
+            "expected_submit_count",
+        ),
+        [
+            (True, False, (1, 100), "generating", 1),
+            (True, False, (1, 101), "large_project_warning", 0),
+            (True, True, (1, 101), "generating", 1),
+            (False, False, (1, 101), "generating", 1),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_guard_off_skips_warning_and_builds(self, mock_services, tmp_path):
+    async def test_server_config_controls_guard_decision(
+        self,
+        mock_services,
+        tmp_path,
+        guard_on,
+        force,
+        scan_result,
+        expected_status,
+        expected_submit_count,
+    ):
         from unittest.mock import AsyncMock
         from src.tools.core_tools import register_core_tools
         mock_services["codebase_tracker"].get_codebase.return_value = None
-        mock_services["config"].cpg.large_project_guard = False   # batch driver
+        mock_services["config"].cpg.large_project_guard = guard_on
+        mock_services["config"].cpg.large_project_max_mb = 10
+        mock_services["config"].cpg.large_project_max_loc = 100
         mock_services["cpg_queue"] = MagicMock()
         mock_services["cpg_queue"].submit = AsyncMock(return_value="queued")
         src = tmp_path / "src"; src.mkdir()
         with patch("src.tools.core_tools.resolve_host_path", return_value=str(src)), \
+             patch("src.tools.core_tools._scan_repo", return_value=scan_result), \
              patch("src.tools.core_tools._get_git_commit_hash", return_value=None), \
              patch("src.tools.core_tools._copy_local_source_tree"), \
              patch("src.tools.core_tools.os.path.abspath", return_value=str(tmp_path)), \
@@ -1344,12 +1368,18 @@ class TestLargeProjectGuard:
              patch("src.tools.core_tools.os.path.join", side_effect=os.path.join):
             mcp = FastMCP("t"); register_core_tools(mcp, mock_services)
             async with Client(mcp) as client:
+                arguments = {
+                    "source_type": "local",
+                    "source_path": str(src),
+                    "language": "c",
+                    "force": force,
+                }
                 result = await client.call_tool(
-                    "generate_cpg",
-                    {"source_type": "local", "source_path": str(src), "language": "c"},
+                    "generate_cpg", arguments,
                 )
             import json; d = json.loads(result.content[0].text)
-            assert d["status"] == "generating"          # guard off -> built, not declined
+            assert d["status"] == expected_status
+            assert mock_services["cpg_queue"].submit.await_count == expected_submit_count
 
 
 class TestCpgBuildFailureLabeling:

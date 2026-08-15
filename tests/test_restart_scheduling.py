@@ -8,7 +8,8 @@ in "loading" forever. The fixes:
     captured main loop, and returns a bool (no longer raises).
   * get_cpg_status only persists "loading" when a restart actually started, and
     reconciles a stranded "loading" (with an error / no live task) to "failed".
-  * _restart_server_async marks FAILED when the reload fails instead of READY.
+  * _restart_server_async marks a definitively failed reload FAILED, but leaves
+    an existing CPG SLEEPING and retryable after a server-lifecycle exception.
 """
 
 import asyncio
@@ -103,6 +104,25 @@ async def test_restart_marks_ready_when_reload_succeeds():
     ]
     assert SessionStatus.READY in statuses
     assert SessionStatus.FAILED not in statuses
+
+
+@pytest.mark.asyncio
+async def test_restart_exception_leaves_existing_cpg_sleeping():
+    mgr = MagicMock()
+    mgr.reload_with_retry.side_effect = RuntimeError("worker name conflict")
+    tracker = MagicMock()
+    services = {"joern_server_manager": mgr, "codebase_tracker": tracker}
+
+    await core_tools._restart_server_async(
+        HASH, "/playground/cpgs/x/cpg.bin", services
+    )
+
+    update = tracker.update_codebase.call_args_list[-1]
+    assert update.kwargs["joern_port"] is None
+    assert update.kwargs["metadata"]["status"] == SessionStatus.SLEEPING
+    assert update.kwargs["metadata"]["error"] is None
+    assert update.kwargs["metadata"]["error_code"] is None
+    assert "worker name conflict" in update.kwargs["metadata"]["last_restart_error"]
 
 
 # ── get_cpg_status zombie reconciliation ──────────────────────────────────────

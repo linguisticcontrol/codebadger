@@ -74,6 +74,10 @@ class JoernServerManager:
         # Hashes with an in-flight spawn, so a concurrent spawn of the same
         # codebase (watchdog respawn vs query auto-wake) can't start a duplicate.
         self._spawning: set = set()
+        # Hashes being stopped deliberately (idle/LRU eviction). The watchdog
+        # must not reinterpret those expected shutdowns as crashes and race a
+        # replacement against Docker's asynchronous container removal.
+        self._intentional_stops: set = set()
 
         # LRU pool
         if max_active_servers is not None:
@@ -181,6 +185,15 @@ class JoernServerManager:
         return sum(self._reservations.values())
 
     def _evict(self, codebase_hash: str) -> None:
+        with self._state_lock:
+            self._intentional_stops.add(codebase_hash)
+        try:
+            self._evict_intentionally(codebase_hash)
+        finally:
+            with self._state_lock:
+                self._intentional_stops.discard(codebase_hash)
+
+    def _evict_intentionally(self, codebase_hash: str) -> None:
         """Tear down a server and mark its codebase sleeping.
 
         The local-state mutations are guarded by ``_state_lock`` directly: the
@@ -715,44 +728,80 @@ class JoernServerManager:
                 ports={f"{self.worker_internal_port}/tcp": ("127.0.0.1", port)},
             )
 
-        try:
-            self.docker_client.containers.run(
-                image=self.worker_image,
-                name=name,
-                command=[
-                    "/opt/joern/joern-cli/joern", "--server",
-                    "--server-host", "0.0.0.0",
-                    "--server-port", str(self.worker_internal_port),
-                ],
-                environment={"JAVA_OPTS": java_opts},
-                working_dir="/tmp",
-                mem_limit=f"{mem_limit_mb}m",
-                # Read-only playground: a query worker only LOADS its cpg.bin and
-                # works in /tmp (Joern's workspace), never writing under
-                # /playground — verified end-to-end. Mounting ro means a query
-                # that escapes the CPGQL denylist can't tamper with or plant files
-                # in other tenants' CPGs/source. The build container (compose)
-                # keeps rw since it writes the CPGs.
-                volumes={self.playground_host_path: {"bind": "/playground", "mode": "ro"}},
-                detach=True,
-                labels={"codebadger.role": "joern-worker", "codebadger.hash": codebase_hash},
-                **run_kwargs,
-            )
-        except ImageNotFound:
-            raise RuntimeError(
-                f"Worker image '{self.worker_image}' not found. Build it with: docker compose build"
-            )
+        for attempt in range(2):
+            try:
+                self.docker_client.containers.run(
+                    image=self.worker_image,
+                    name=name,
+                    command=[
+                        "/opt/joern/joern-cli/joern", "--server",
+                        "--server-host", "0.0.0.0",
+                        "--server-port", str(self.worker_internal_port),
+                    ],
+                    environment={"JAVA_OPTS": java_opts},
+                    working_dir="/tmp",
+                    mem_limit=f"{mem_limit_mb}m",
+                    # Read-only playground: a query worker only LOADS its cpg.bin and
+                    # works in /tmp (Joern's workspace), never writing under
+                    # /playground — verified end-to-end. Mounting ro means a query
+                    # that escapes the CPGQL denylist can't tamper with or plant files
+                    # in other tenants' CPGs/source. The build container (compose)
+                    # keeps rw since it writes the CPGs.
+                    volumes={self.playground_host_path: {"bind": "/playground", "mode": "ro"}},
+                    detach=True,
+                    labels={"codebadger.role": "joern-worker", "codebadger.hash": codebase_hash},
+                    **run_kwargs,
+                )
+                break
+            except ImageNotFound:
+                raise RuntimeError(
+                    f"Worker image '{self.worker_image}' not found. Build it with: docker compose build"
+                )
+            except APIError as e:
+                if getattr(e, "status_code", None) != 409 or attempt > 0:
+                    raise
+                logger.warning(
+                    f"Worker container name {name} was still reserved; "
+                    "waiting for removal and retrying once"
+                )
+                self._remove_worker_container(name)
         with self._state_lock:
             self._worker_containers[codebase_hash] = name
 
-    def _remove_worker_container(self, name: str) -> None:
+    def _remove_worker_container(
+        self, name: str, timeout_seconds: float = 15.0
+    ) -> None:
+        """Remove a worker and wait until Docker releases its name."""
         try:
-            self.docker_client.containers.get(name).remove(force=True)
-            logger.debug(f"Removed worker container {name}")
+            container = self.docker_client.containers.get(name)
         except NotFound:
-            pass
-        except Exception as e:
-            logger.warning(f"Error removing worker container {name}: {e}")
+            return
+
+        try:
+            container.remove(force=True)
+        except APIError as e:
+            detail = str(getattr(e, "explanation", "") or e).lower()
+            removal_in_progress = (
+                getattr(e, "status_code", None) == 409
+                and "removal" in detail
+                and "already in progress" in detail
+            )
+            if not removal_in_progress:
+                raise
+            logger.debug(f"Worker container {name} removal is already in progress")
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                self.docker_client.containers.get(name)
+            except NotFound:
+                logger.debug(f"Removed worker container {name}")
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Timed out waiting for Docker to release worker container name {name}"
+                )
+            time.sleep(0.1)
 
     def _cleanup_orphan_workers(self) -> None:
         """Remove worker containers left over from a previous run (pool mode)."""
@@ -1144,9 +1193,23 @@ class JoernServerManager:
                     # Skip servers still inside their startup window — their JVM
                     # may not have bound the port yet, and killing it here is the
                     # race that caused booting servers to be reaped under load.
-                    if codebase_hash in self._spawning:
-                        continue
+                    with self._state_lock:
+                        if (
+                            codebase_hash in self._spawning
+                            or codebase_hash in self._intentional_stops
+                            or self._ports.get(codebase_hash) != port
+                        ):
+                            continue
                     if not await self._is_server_healthy(port, codebase_hash):
+                        # Health probes run outside the state lock. An intentional
+                        # eviction may have completed while this probe was in
+                        # flight; recheck before treating the old port as a crash.
+                        with self._state_lock:
+                            if (
+                                codebase_hash in self._intentional_stops
+                                or self._ports.get(codebase_hash) != port
+                            ):
+                                continue
                         logger.warning(f"Joern server {codebase_hash}:{port} is dead, respawning")
                         self.terminate_server(codebase_hash)
                         if self._restart_callback and self.codebase_tracker:

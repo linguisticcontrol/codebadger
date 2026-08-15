@@ -4,6 +4,7 @@ Docker is mocked, so these verify the orchestration (container run/remove args,
 state bookkeeping, error handling) without a daemon.
 """
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -46,8 +47,20 @@ def pool(monkeypatch):
     fake.containers.list.return_value = []
     monkeypatch.setattr(jsm.docker, "from_env", lambda: fake)
     m = jsm.JoernServerManager(config=load_config())
-    m._wait_for_server = lambda port, timeout=120: True  # skip real readiness poll
+    m._wait_for_server = (
+        lambda port, timeout=120, codebase_hash="": True
+    )  # skip real readiness poll
     return m, fake
+
+
+def _docker_conflict(explanation):
+    response = MagicMock()
+    response.status_code = 409
+    return jsm.APIError(
+        "Docker conflict",
+        response=response,
+        explanation=explanation,
+    )
 
 
 def test_pool_construction_uses_worker_port_range_and_cleans_orphans(pool):
@@ -84,6 +97,51 @@ def test_pool_terminate_removes_container_and_clears_state(pool):
     assert "abc" not in m._worker_containers
     assert "abc" not in m._ports
     assert "abc" not in m._reservations
+
+
+def test_worker_start_waits_until_in_progress_removal_releases_name(
+    pool, monkeypatch
+):
+    m, fake = pool
+    stale = MagicMock()
+    stale.remove.side_effect = _docker_conflict(
+        "removal of container is already in progress"
+    )
+    fake.containers.get.side_effect = [
+        stale,
+        stale,
+        jsm.NotFound("gone"),
+    ]
+    monkeypatch.setattr(m, "_wait_host_port_free", lambda _port: None)
+    monkeypatch.setattr(jsm.time, "sleep", lambda _seconds: None)
+
+    m._start_worker_container("abc", 14000, "-Xmx2G", 3072)
+
+    stale.remove.assert_called_once_with(force=True)
+    assert fake.containers.get.call_count == 3
+    fake.containers.run.assert_called_once()
+
+
+def test_worker_start_reconciles_name_conflict_and_retries_once(
+    pool, monkeypatch
+):
+    m, fake = pool
+    conflicting = MagicMock()
+    fake.containers.get.side_effect = [
+        jsm.NotFound("initially absent"),
+        conflicting,
+        jsm.NotFound("removed"),
+    ]
+    fake.containers.run.side_effect = [
+        _docker_conflict("container name is already in use"),
+        MagicMock(),
+    ]
+    monkeypatch.setattr(m, "_wait_host_port_free", lambda _port: None)
+
+    m._start_worker_container("abc", 14000, "-Xmx2G", 3072)
+
+    assert fake.containers.run.call_count == 2
+    conflicting.remove.assert_called_once_with(force=True)
 
 
 def test_pool_missing_image_raises_and_cleans_up(pool, monkeypatch):
@@ -196,6 +254,52 @@ def test_evict_releases_port_even_when_terminate_noops(pool):
 
     assert m.port_manager.get_port("orphan") is None
     assert m.port_manager.available_count() == total
+
+
+def test_evict_marks_shutdown_intent_while_terminating(pool, monkeypatch):
+    m, _ = pool
+    observed = []
+
+    def terminate(codebase_hash):
+        observed.append(codebase_hash in m._intentional_stops)
+        return True
+
+    monkeypatch.setattr(m, "terminate_server", terminate)
+    m._evict("abc")
+
+    assert observed == [True]
+    assert "abc" not in m._intentional_stops
+
+
+@pytest.mark.asyncio
+async def test_watchdog_ignores_port_removed_during_health_probe(pool, monkeypatch):
+    m, _ = pool
+    m._ports["abc"] = 14000
+    terminate = MagicMock()
+    restart = MagicMock()
+    monkeypatch.setattr(m, "terminate_server", terminate)
+    m._restart_callback = restart
+
+    async def unhealthy_after_eviction(_port, _codebase_hash):
+        with m._state_lock:
+            m._ports.pop("abc", None)
+        return False
+
+    sleeps = 0
+
+    async def one_watchdog_tick(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(m, "_is_server_healthy", unhealthy_after_eviction)
+    monkeypatch.setattr(jsm.asyncio, "sleep", one_watchdog_tick)
+
+    await m._watchdog_loop()
+
+    terminate.assert_not_called()
+    restart.assert_not_called()
 
 
 def test_idle_candidates_local_mode_picks_stale_only(pool, monkeypatch):
@@ -313,6 +417,7 @@ def test_get_or_create_client_rebuilds_on_stale_port(pool, monkeypatch):
 def test_get_or_create_client_reuses_client_on_matching_port(pool, monkeypatch):
     m, _ = pool
     good = MagicMock()
+    good.host = m._joern_endpoint("abc", 14002)[0]
     good.port = 14002
     m._clients["abc"] = good
     monkeypatch.setattr(m, "get_server_port", lambda h: 14002)

@@ -1319,7 +1319,12 @@ async def _restart_server_async(
         codebase_tracker.update_codebase(
             codebase_hash=codebase_hash,
             joern_port=joern_port,
-            metadata={"status": SessionStatus.READY}
+            metadata={
+                "status": SessionStatus.READY,
+                "error": None,
+                "error_code": None,
+                "last_restart_error": None,
+            }
         )
 
         # Fire-and-forget so the restart returns promptly; warm-up runs in the
@@ -1333,11 +1338,17 @@ async def _restart_server_async(
             codebase_tracker = services["codebase_tracker"]
             codebase_tracker.update_codebase(
                 codebase_hash=codebase_hash,
-                metadata={"status": SessionStatus.FAILED, "error": f"Server restart failed: {e}"}
+                joern_port=None,
+                metadata={
+                    "status": SessionStatus.SLEEPING,
+                    "error": None,
+                    "error_code": None,
+                    "last_restart_error": f"Server restart failed: {e}",
+                },
             )
         except Exception as tracker_error:
             logger.warning(
-                f"Could not mark {codebase_hash} FAILED after restart error: {tracker_error}"
+                f"Could not mark {codebase_hash} SLEEPING after restart error: {tracker_error}"
             )
 
 

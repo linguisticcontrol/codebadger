@@ -63,6 +63,11 @@ REDACTED_LOCAL_SOURCE = "<redacted:local-source>"
 CPG_CACHE_FORMAT_VERSION = "cpg-cache-v4"
 
 
+def _new_uncached_codebase_hash() -> str:
+    """Return a one-use identifier compatible with public CPG query tools."""
+    return uuid.uuid4().hex[:16]
+
+
 def _public_source_path(source_type: str, source_path: Optional[str]) -> Optional[str]:
     """Redact local source paths before returning them to clients."""
     if not source_path:
@@ -2180,6 +2185,7 @@ Examples:
             # checkout of a different revision produces a distinct CPG.
             commit_hash = None
             content_fp = code  # snippet body, when source_type == "snippet"
+            cache_reuse_bypassed = False
             if source_type == "local":
                 try:
                     # Content fingerprint of the tree (works for non-git sources and
@@ -2191,14 +2197,13 @@ Examples:
                         raise ValidationError("Fingerprint helper returned no digest")
                     logger.info(f"Local source content fingerprint: {content_fp[:16]}")
                 except Exception as e:
-                    logger.error(
-                        f"Failed to fingerprint local source; refresh aborted: {e}",
+                    cache_reuse_bypassed = True
+                    content_fp = None
+                    logger.warning(
+                        "Failed to fingerprint local source; proceeding with a fresh "
+                        f"uncached generation: {e}",
                         exc_info=True,
                     )
-                    raise ValidationError(
-                        "Failed to fingerprint local source; CPG refresh was not started "
-                        "because safe cache reuse could not be verified"
-                    ) from e
 
             build_spec = _get_cpg_build_spec(
                 language=language,
@@ -2211,18 +2216,29 @@ Examples:
                 auto_system_headers=auto_system_headers,
                 compile_commands=compile_commands,
             )
-            codebase_hash = get_cpg_cache_key(
-                source_type,
-                source_path,
-                language,
-                commit_hash,
-                content=content_fp,
-                branch=branch,
-                build_spec=build_spec,
-            )
+            if cache_reuse_bypassed:
+                # Fingerprinting only authorizes cache reuse; it is not required to
+                # analyze a stable copied snapshot. A random valid identifier keeps
+                # this generation addressable without allowing a later request to
+                # mistake it for a content-addressed cache hit.
+                codebase_hash = _new_uncached_codebase_hash()
+            else:
+                codebase_hash = get_cpg_cache_key(
+                    source_type,
+                    source_path,
+                    language,
+                    commit_hash,
+                    content=content_fp,
+                    branch=branch,
+                    build_spec=build_spec,
+                )
             logger.info(f"Processing codebase with hash: {codebase_hash}")
 
-            existing_codebase = codebase_tracker.get_codebase(codebase_hash)
+            existing_codebase = (
+                None
+                if cache_reuse_bypassed
+                else codebase_tracker.get_codebase(codebase_hash)
+            )
             if existing_codebase and existing_codebase.cpg_path and os.path.exists(existing_codebase.cpg_path):
                 logger.info(f"Found existing codebase in DB: {codebase_hash}")
 
@@ -2534,11 +2550,20 @@ Examples:
 
                 estimate = _estimate_processing_time(codebase_dir, language, has_cpg=False)
 
+                generation_message = (
+                    "CPG generation started without cache reuse because source "
+                    "fingerprinting was unavailable. "
+                    if cache_reuse_bypassed
+                    else "CPG generation started in background. "
+                )
                 return {
                     "success": True,
                     "codebase_hash": codebase_hash,
                     "status": SessionStatus.GENERATING,
-                    "message": f"CPG generation started in background. Estimated time: {estimate}. Use get_cpg_status to check progress.",
+                    "message": (
+                        f"{generation_message}Estimated time: {estimate}. "
+                        "Use get_cpg_status to check progress."
+                    ),
                     "estimated_time": estimate,
                     **_public_codebase_fields(
                         source_type=source_type,

@@ -5,7 +5,7 @@ Tests for MCP tools
 import asyncio
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -297,46 +297,57 @@ class TestMCPTools:
                 assert str(source_dir) not in result_dict["error"]
 
     @pytest.mark.asyncio
-    async def test_generate_cpg_fingerprint_failure_stops_before_cache_or_copy(
+    async def test_generate_cpg_fingerprint_failure_bypasses_cache_and_generates(
         self, mock_services, tmp_path
     ):
-        """A local refresh must fail closed when its source cannot be fingerprinted."""
+        """Fingerprint failure must produce fresh, non-reusable generations."""
         from src.tools.core_tools import register_core_tools
 
         source_dir = tmp_path / "private-repo"
         source_dir.mkdir()
         mock_services["config"].cpg.large_project_guard = False
         mock_services["codebase_tracker"].get_codebase.return_value = None
+        cpg_queue = MagicMock()
+        cpg_queue.submit = AsyncMock(return_value=None)
+        mock_services["cpg_queue"] = cpg_queue
+        uncached_hashes = ["1111111111111111", "2222222222222222"]
 
         with patch(
             "src.tools.core_tools._fingerprint_local_source",
             side_effect=OSError(f"permission denied: {source_dir}"),
         ), patch("src.tools.core_tools.get_cpg_cache_key") as cache_key, patch(
-            "src.tools.core_tools._copy_local_source_tree"
-        ) as copy_source:
+            "src.tools.core_tools._new_uncached_codebase_hash",
+            side_effect=uncached_hashes,
+        ), patch(
+            "src.tools.core_tools.__file__",
+            str(tmp_path / "src" / "tools" / "core_tools.py"),
+        ):
             mcp = FastMCP("TestServer")
             register_core_tools(mcp, mock_services)
 
             async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "generate_cpg",
-                    {
-                        "source_type": "local",
-                        "source_path": str(source_dir),
-                        "language": "c",
-                    },
-                )
+                results = [
+                    await client.call_tool(
+                        "generate_cpg",
+                        {
+                            "source_type": "local",
+                            "source_path": str(source_dir),
+                            "language": "c",
+                        },
+                    )
+                    for _ in range(2)
+                ]
 
         import json
 
-        result_dict = json.loads(result.content[0].text)
-        assert result_dict["success"] is False
-        assert "failed to fingerprint local source" in result_dict["error"].lower()
-        assert "safe cache reuse" in result_dict["error"].lower()
-        assert str(source_dir) not in result_dict["error"]
+        result_dicts = [json.loads(result.content[0].text) for result in results]
+        assert [result["codebase_hash"] for result in result_dicts] == uncached_hashes
+        assert all(result["success"] is True for result in result_dicts)
+        assert all(result["status"] == "generating" for result in result_dicts)
+        assert all("without cache reuse" in result["message"] for result in result_dicts)
         cache_key.assert_not_called()
-        copy_source.assert_not_called()
         mock_services["codebase_tracker"].get_codebase.assert_not_called()
+        assert cpg_queue.submit.await_count == 2
 
     @pytest.mark.asyncio
     async def test_generate_cpg_passes_all_graph_options_to_cache_identity(
